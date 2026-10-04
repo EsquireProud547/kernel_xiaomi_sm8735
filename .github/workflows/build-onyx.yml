@@ -2,25 +2,38 @@ name: Build Onyx Kernel
 
 # Ported from gki-clo/.github/workflows/build-capybara.yml (Capybara CLO 6.6.77)
 # onto the Xiaomi SM8735 "onyx" GKI 6.6.82 tree.
-# What is reused verbatim: runner/swap/cleanup, deps, Clang fetch+cache, ccache
-# layering, ReSukiSU, SUSFS + fixup, Droidspaces kABI patch, build, AnyKernel3,
-# artifact upload. What changed and why:
-#   * config tuning (HZ300/ThinLTO/ZRAM-LZ4/Droidspaces) is BAKED INTO
-#     onyx_defconfig instead of 20 lines of `sed` on the defconfig text.
-#     The sed approach silently no-ops when a "# CONFIG_X is not set" line is
-#     absent -- e.g. "# CONFIG_LTO_CLANG_THIN is not set" does not even exist
-#     unless the compiler satisfies HAS_LTO_CLANG.
-#   * Xiaomi vendor modules are merged in from vendor/onyx_perf.config.
-#   * BBRv3 / NTSYNC / Baseband-guard are intentionally NOT ported yet (the
-#     6.6.82 tree has no tcp_bbr3.c, no drivers/misc/ntsync.c, no
-#     security/baseband-guard). See arch/arm64/configs/onyx_defconfig header.
-#   * The build summary now reports what actually happened instead of always
-#     claiming success.
+#
+# Reused verbatim: runner/swap/cleanup, deps, Clang fetch+cache, ccache
+# layering, ReSukiSU, SUSFS + fixup, Droidspaces kABI patch, build command,
+# AnyKernel3 packaging, artifact upload.
+#
+# Config synthesis now follows the STOCK Kleaf mixed-build instead of a
+# hand-baked defconfig:
+#
+#   gki_defconfig  +  onyx_gki.fragment  +  vendor/onyx_perf.config (=y only)
+#                  +  onyx_susfs.fragment (conditional)
+#   --merge_config.sh -m -r -y-->  make <defconfig>
+#
+# with the same three gates build.config.msm.common applies, so a fragment that
+# does not take effect fails the build instead of silently disabling a feature.
+#
+# This also fixes three things the baked defconfig had wrong:
+#   * BTF. The stock GKI base ships CONFIG_DEBUG_INFO_BTF=y; the baked
+#     defconfig had set CONFIG_DEBUG_INFO_REDUCED=y, which is a hard blocker
+#     (lib/Kconfig.debug: DEBUG_INFO_BTF depends on !DEBUG_INFO_REDUCED) and
+#     was dropping BTF with no warning at all.
+#   * Module signature hash. Baked defconfig said MODULE_SIG_SHA1, the GKI base
+#     says MODULE_SIG_SHA512. They are mutually exclusive (a `choice`), and
+#     stock vendor modules are signed with SHA-512.
+#   * CONFIG_MODULE_SIG_PROTECT=y, which is what lets the GKI load modules
+#     whose signature it cannot verify.
+#
+# BBRv3 / NTSYNC / Baseband-guard are still not ported: 6.6.82 has no
+# net/ipv4/tcp_bbr3.c, no drivers/misc/ntsync.c, no security/baseband-guard.
 
 env:
   CLANG_VERSION: clang-r596125
   CLANG_BRANCH: android17-release
-  DEFCONFIG: onyx_defconfig
   VENDOR_FRAGMENT: arch/arm64/configs/vendor/onyx_perf.config
   KERNEL_CODENAME: Onyx
 
@@ -40,11 +53,19 @@ on:
         type: string
         default: ""
       enable_vendor_modules:
-        description: "Merge Xiaomi onyx vendor modules into the GKI config"
+        description: "Merge the built-in (=y) entries of vendor/onyx_perf.config"
         type: boolean
         default: true
       enable_autofdo:
         description: "Use the upstream GKI AutoFDO profile (non-fatal if unavailable)"
+        type: boolean
+        default: true
+      enable_btf:
+        description: "BTF for eBPF/CO-RE (needs pahole >= 1.21; auto-disabled if missing)"
+        type: boolean
+        default: true
+      reduce_debug:
+        description: "Trim UBSAN/profiling/debugfs (ABI-safe; applied to the merged defconfig)"
         type: boolean
         default: true
       bundle_modules:
@@ -109,6 +130,39 @@ jobs:
             ccache flex bison libncurses-dev libssl-dev libelf-dev \
             cpio wget curl jq git zip unzip bc \
             gcc g++ make device-tree-compiler python3
+
+      - name: Install pahole for BTF
+        if: inputs.enable_btf
+        run: |
+          # CONFIG_DEBUG_INFO_BTF needs pahole to turn DWARF into BTF, and the
+          # kernel Kconfig demands >= 1.21 because we build DWARF5
+          # (lib/Kconfig.debug: depends on !DEBUG_INFO_DWARF5 || PAHOLE_VERSION >= 121).
+          # 1.23+ also gives PAHOLE_HAS_BTF_TAG, which bpftool needs for
+          # precise fentry/fexit CO-RE targets.
+          sudo apt-get install -y -qq dwarves
+          ver=$(pahole --version)
+          echo "pahole: $ver"
+          maj=$(echo "$ver" | sed -E 's/v([0-9]+)\.([0-9]+).*/\1\2/')
+          if [ "${maj:-0}" -lt 121 ]; then
+            # Non-fatal: degrade to a no-BTF build rather than failing outright.
+            echo "::warning::pahole $ver is older than v1.21 (DWARF5 minimum) — BTF disabled"
+            echo "BTF_UNAVAILABLE=1" >> $GITHUB_ENV
+          elif [ "$maj" -ge 123 ]; then
+            echo "  BTF_TAG supported (>= 1.23)"
+          fi
+
+      - name: Patch libbpf for modern host compilers
+        if: inputs.enable_btf
+        run: |
+          # CONFIG_DEBUG_INFO_BTF pulls in tools/bpf/resolve_btfids, which links
+          # tools/lib/bpf. That code fails to build with a current host compiler
+          # (strchr is const-correct in C23) and tools/lib/bpf/Makefile:89 uses
+          # `override CFLAGS += -Werror`, so it is fatal. One-line cast fixes it.
+          if grep -q 'next_path = (char \*)strchr' tools/lib/bpf/libbpf.c; then
+            echo "already patched"
+          else
+            patch -p1 --forward < .github/actions/libbpf_strchr_const.patch
+          fi
 
       - name: Cache Clang toolchain
         id: cache-clang
@@ -190,130 +244,223 @@ jobs:
           patch -p1 --forward < .github/actions/droidspaces_sysvipc.patch
           echo "DROIDSPACES_STATUS=applied" >> $GITHUB_ENV
 
-      - name: Configure kernel
+      - name: Configure kernel (official Kleaf-style synthesis)
         run: |
           export ARCH=arm64 SUBARCH=arm64
 
-          # Capybara tuning (HZ 300, ThinLTO, ZRAM LZ4, Droidspaces config block)
-          # already lives in onyx_defconfig -- nothing to sed here.
-          make O=out CC=clang LLVM=1 LLVM_IAS=1 "$DEFCONFIG"
-
-          # Xiaomi OEM bits from the in-tree vendor fragment. These are the same
-          # fragment the vendor build applies (build.config.msm.perf ->
-          # apply_defconfig_fragment vendor/onyx_perf.config).
+          # ==================================================================
+          # Config synthesis, mirroring build.config.msm.perf +
+          # build.config.msm.common from the stock Kleaf mixed-build:
           #
-          # Only the "=y" entries are merged. The 33 "=m" entries are OEM
-          # modules that link against symbols exported by the vendor
-          # (msm-kernel) image, which does not exist in a single-tree GKI
-          # build. Merging them makes modpost fail with:
+          #   gki_defconfig                    stock GKI base
+          #     + onyx_gki.fragment            Capybara tuning
+          #     + vendor/onyx_perf.config      device bits (=y only, see below)
+          #     + onyx_susfs.fragment          only when enable_susfs
+          #   --merge_config.sh -m -r -y-->  merged defconfig
+          #   --make-->                       .config
+          #
+          # followed by the same three gates the vendor build uses, so a
+          # fragment that does not take effect is a build failure rather than
+          # a silently missing feature.
+          # ==================================================================
+
+          BASE_DEFCONFIG=arch/arm64/configs/gki_defconfig
+          TUNING_FRAGMENT=arch/arm64/configs/onyx_gki.fragment
+          DEBUG_FRAGMENT=arch/arm64/configs/onyx_debug_reduction.fragment
+          SUSFS_FRAGMENT=arch/arm64/configs/onyx_susfs.fragment
+          MERGED_DEFCONFIG=onyx_gki_defconfig
+          MERGED_PATH="out/arch/arm64/configs/$MERGED_DEFCONFIG"
+
+          # ---- assemble the fragment list ----------------------------------
+          FRAGMENTS="$BASE_DEFCONFIG $TUNING_FRAGMENT"
+          echo "Fragments:"
+          for f in $FRAGMENTS; do echo "  - $f"; done
+
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            FRAGMENTS="$FRAGMENTS $SUSFS_FRAGMENT"
+            echo "           $SUSFS_FRAGMENT (enable_susfs)"
+          fi
+
+          # ---- Xiaomi OEM bits, built-in entries only -----------------------
+          # The 33 "=m" entries in vendor/onyx_perf.config are OEM modules that
+          # link against symbols exported by the vendor (msm-kernel) image,
+          # which does not exist in a single-tree GKI build. Merging them makes
+          # modpost fail with:
           #   ERROR: modpost: "qcom_smem_alloc" [...mca_qcom_smem.ko] undefined!
           #   ERROR: modpost: "pwrkey_irq_notifier_list" [...mtdoops.ko] undefined!
           # (qcom_smem_alloc needs CONFIG_QCOM_SMEM, pwrkey_irq_notifier_list
-          # needs CONFIG_INPUT_PM8941_PWRKEY -- neither exists in a GKI config.)
-          #
-          # Dropping them costs nothing: they are never packaged anyway (the
-          # device loads the stock ones from vendor_dlkm), so we only need the
-          # "=y" entries that actually land in the Image. Deriving the filter
-          # from the fragment keeps this correct if Xiaomi adds entries later.
+          # needs CONFIG_INPUT_PM8941_PMRKEY -- neither exists in a GKI config.)
+          # They are never packaged anyway -- the device loads the stock ones
+          # from vendor_dlkm -- so only the "=y" entries, which really do reach
+          # the Image, are merged. Derived from the fragment so it stays
+          # correct if Xiaomi adds entries.
+          VENDOR_BUILTIN=""
           if [ "${{ inputs.enable_vendor_modules }}" = "true" ]; then
-            echo "Merging built-in (=y) entries from $VENDOR_FRAGMENT ..."
-            VENDOR_BUILTIN="$(mktemp)"
-            grep -E '^CONFIG_[A-Za-z0-9_]+=y$' "$VENDOR_FRAGMENT" | tee "$VENDOR_BUILTIN" | sed 's/^/  /'
-            if [ -s "$VENDOR_BUILTIN" ]; then
-              ./scripts/kconfig/merge_config.sh -m -O out out/.config "$VENDOR_BUILTIN" \
-                | sed 's/^/  /' || true
-            fi
-            rm -f "$VENDOR_BUILTIN"
-            echo "  (skipped $(grep -cE '^CONFIG_[A-Za-z0-9_]+=m$' "$VENDOR_FRAGMENT") OEM =m modules:"
-            echo "   they need vendor-image symbols and are not packaged)"
+            VENDOR_BUILTIN="vendor_builtin.fragment"
+            echo "  filtering $VENDOR_FRAGMENT: keeping =y, dropping $(grep -cE '^CONFIG_[A-Za-z0-9_]+=m$' "$VENDOR_FRAGMENT") OEM =m modules"
+            grep -E '^CONFIG_[A-Za-z0-9_]+=y$' "$VENDOR_FRAGMENT" > "$VENDOR_BUILTIN" || true
+            sed 's/^/    /' "$VENDOR_BUILTIN"
+            FRAGMENTS="$FRAGMENTS $VENDOR_BUILTIN"
           fi
 
-          # ReSukiSU + SUSFS config. This must live here (not in the defconfig)
-          # because it is conditional on inputs.enable_susfs, and because the
-          # symbols only exist once the SUSFS patch has been applied.
+          # ---- BTF ---------------------------------------------------------
+          # The stock GKI base already ships CONFIG_DEBUG_INFO_BTF=y, which is
+          # why the old baked defconfig lost it: its CONFIG_DEBUG_INFO_REDUCED=y
+          # blocks BTF outright (lib/Kconfig.debug: DEBUG_INFO_BTF depends on
+          # !DEBUG_INFO_REDUCED) and olddefconfig dropped it with no warning.
           #
-          # NOTE: gki-clo appended all of these with "=y", including
-          # CONFIG_KSU_SUSFS_SUS_PATH -- but SUS_PATH is a *string* (the
-          # directory susfs mounts are hidden in), so "=y" made the path
-          # literally "y". It is set properly below.
-          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
-            scripts/config --file out/.config \
-              -e CONFIG_KSU -e CONFIG_KSU_SUSFS \
-              -e CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT \
-              -e CONFIG_KSU_SUSFS_SUS_MOUNT \
-              -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_KSU_DENYLIST \
-              -e CONFIG_KSU_SUSFS_SUS_KSTAT \
-              -e CONFIG_KSU_SUSFS_SUS_OVERLAYFS
-            scripts/config --file out/.config \
-              --set-str CONFIG_KSU_SUSFS_SUS_PATH "/system/susfs"
+          # Turning BTF *off* is a deliberate override, not a fragment: the base
+          # has it as =y, so a fragment saying =n would trip gate 1. It is
+          # therefore applied below with the debug reduction, before make.
+          BTF_OFF=0
+          if [ "${{ inputs.enable_btf }}" != "true" ] || [ "${{ env.BTF_UNAVAILABLE }}" = "1" ]; then
+            echo "  BTF disabled (input off, or pahole older than v1.21)"
+            BTF_OFF=1
+          else
+            echo "  BTF requested (stock GKI base provides CONFIG_DEBUG_INFO_BTF)"
           fi
 
-          # AutoFDO (non-fatal: the +archive endpoint 5xx when no profile is built)
+          # ---- AutoFDO (probed BEFORE the merge so it becomes a fragment) --
+          # Non-fatal: the android.googlesource +archive endpoint 5xx when no
+          # profile has been built for the branch. Making it a fragment rather
+          # than a post-merge scripts/config edit is what keeps gate 3 honest:
+          # nothing may change the config after the merge.
+          AUTOFDO_FRAGMENT=""
           if [ "${{ inputs.enable_autofdo }}" = "true" ] \
              && mkdir -p afdo_profile \
              && curl -fLSs --connect-timeout 30 --max-time 60 \
                   "https://android.googlesource.com/kernel/common/+archive/refs/heads/android15-6.6/android/gki/aarch64/afdo.tar.gz" \
                   2>/dev/null | tar -xz -C afdo_profile/ \
              && [ -f "afdo_profile/kernel.afdo" ]; then
-            scripts/config --file out/.config -e CONFIG_AUTOFDO_CLANG
+            AUTOFDO_FRAGMENT=onyx_autofdo.fragment
+            echo "CONFIG_AUTOFDO_CLANG=y" > "$AUTOFDO_FRAGMENT"
+            FRAGMENTS="$FRAGMENTS $AUTOFDO_FRAGMENT"
             # scripts/Makefile.autofdo keys off CLANG_AUTOFDO_PROFILE exactly.
             echo "CLANG_AUTOFDO_PROFILE=$PWD/afdo_profile/kernel.afdo" >> $GITHUB_ENV
             echo "AUTOFDO_STATUS=enabled" >> $GITHUB_ENV
-            echo "  CONFIG_AUTOFDO_CLANG=y"
+            echo "  - $AUTOFDO_FRAGMENT (AutoFDO profile fetched)"
           else
             echo "AUTOFDO_STATUS=skipped" >> $GITHUB_ENV
             echo "  AutoFDO skipped (disabled by input or profile unavailable)"
           fi
 
-          # ABI-safe debug reduction. Every symbol here is chosen because turning
-          # it off does not resize or reorder any exported struct.
-          scripts/config --file out/.config \
-            -e CONFIG_DEBUG_INFO_REDUCED \
-            -d CONFIG_DEBUG_MISC -d CONFIG_BT_DEBUGFS \
-            -d CONFIG_DEBUG_MEMORY_INIT -d CONFIG_PROFILING \
-            -d CONFIG_PRINTK_CALLER -d CONFIG_RCU_TRACE \
-            -d CONFIG_CMA_DEBUGFS \
-            -d CONFIG_UBSAN -d CONFIG_UBSAN_BOUNDS \
-            -d CONFIG_UBSAN_ARRAY_BOUNDS -d CONFIG_UBSAN_LOCAL_BOUNDS \
-            -d CONFIG_UBSAN_SANITIZE_ALL -d CONFIG_UBSAN_TRAP \
-            -d CONFIG_CLEANCACHE -d CONFIG_PRINTK_TIME
+          # ---- GATE 1: no fragment may override an existing =y/m value -----
+          # (build.config.msm.common:97)
+          #
+          # The vendor build's fragments are strictly additive: anything that
+          # flips a value the base already sets is an accident (two fragments
+          # disagreeing) and must fail loudly. The debug reduction below is the
+          # one deliberate exception, and it is therefore NOT a fragment -- it
+          # is applied to the merged defconfig after the merge and before make,
+          # which keeps this gate strict and still lets gate 3 see the truth.
+          mkdir -p out/arch/arm64/configs
+          MERGE_OUT=$(mktemp)
+          KCONFIG_CONFIG="$PWD/$MERGED_PATH" \
+            ./scripts/kconfig/merge_config.sh -m -r -y $FRAGMENTS | tee "$MERGE_OUT"
 
-          # Single convergence point: drops anything whose dependencies are unmet
-          # (e.g. CONFIG_KSU* when SUSFS/ReSukiSU did not land) and re-derives
-          # CONFIG_HZ / CONFIG_ZRAM_DEF_COMP.
-          make O=out olddefconfig CC=clang LLVM=1 LLVM_IAS=1 2>/dev/null
+          if grep -qE -e "Previous value: [^=]+=[ym]" "$MERGE_OUT"; then
+            echo "========================================================"
+            echo "::error::Detected overridden config!"
+            grep -C1 -E -e "Previous value: [^=]+=[ym]" "$MERGE_OUT"
+            echo "A fragment tried to redefine a value the base already sets."
+            echo "Fragments are additive-only -- see the rules in $TUNING_FRAGMENT."
+            exit 1
+          fi
+          echo "  [gate 1/3] no overridden values"
 
-          # Droidspaces is only real if SYSVIPC survived AND the kABI patch held.
-          if grep -q "^CONFIG_SYSVIPC=y" out/.config; then
-            echo "DROIDSPACES_STATUS=applied (SYSVIPC=y, kABI-safe)" >> $GITHUB_ENV
+          # ---- deliberate overrides applied to the merged defconfig --------
+          # Fragments are additive-only, so anything that flips a value the
+          # base already sets has to happen here -- still BEFORE make, so that
+          # gate 3's diffconfig stays a real assertion.
+          OVERRIDE_ARGS=""
+          if [ "${{ inputs.reduce_debug }}" = "true" ]; then
+            while IFS= read -r line; do
+              case "$line" in
+                CONFIG_*)                  OVERRIDE_ARGS="$OVERRIDE_ARGS -e ${line%%=*}" ;;
+                "# CONFIG_"*" is not set")
+                                            OVERRIDE_ARGS="$OVERRIDE_ARGS -d $(echo "${line#\# }" | cut -d' ' -f1)" ;;
+              esac
+            done < "$DEBUG_FRAGMENT"
+            echo "  debug reduction: $(echo $OVERRIDE_ARGS | wc -w) overrides from $DEBUG_FRAGMENT"
           else
-            echo "DROIDSPACES_STATUS=patch applied but CONFIG_SYSVIPC was dropped" >> $GITHUB_ENV
-            echo "::warning::CONFIG_SYSVIPC was dropped -- Droidspaces IPC unavailable"
+            echo "  debug reduction disabled, keeping the GKI base defaults"
           fi
 
-          # SUSFS: the patch landing is not enough, the symbols must survive
-          # olddefconfig too. Verified here so a silent no-op can never again
-          # masquerade as a working feature.
+          if [ "$BTF_OFF" = "1" ]; then
+            # DEBUG_INFO_BTF_MODULES must go too, and so must the symbol that
+            # merely depends on BTF modules -- otherwise gate 3 sees it as
+            # "requested enabled but dropped" and fails the build.
+            OVERRIDE_ARGS="$OVERRIDE_ARGS -d CONFIG_DEBUG_INFO_BTF \
+                              -d CONFIG_DEBUG_INFO_BTF_MODULES \
+                              -d CONFIG_MODULE_ALLOW_BTF_MISMATCH"
+          fi
+
+          if [ -n "$OVERRIDE_ARGS" ]; then
+            # shellcheck disable=SC2086
+            scripts/config --file "$MERGED_PATH" $OVERRIDE_ARGS
+          fi
+
+          # ---- build the merged defconfig, GATE 2: warnings are errors -----
+          # (build.config.msm.common:105-112)
+          make O=out CC=clang LLVM=1 LLVM_IAS=1 "$MERGED_DEFCONFIG" 2>&1 | tee "$MERGE_OUT" | tail -5
+          if grep -q -e "warning:" "$MERGE_OUT"; then
+            echo "========================================================"
+            echo "::error::Treating config warnings as errors"
+            grep -e "warning:" "$MERGE_OUT"
+            exit 1
+          fi
+          echo "  [gate 2/3] no kconfig warnings"
+
+          # No scripts/config edits from here on. Everything the kernel is
+          # asked to do came from a fragment, which is what makes gate 3 below
+          # a meaningful assertion rather than a formality.
+
+          # ---- GATE 3: every fragment line must have survived --------------
+          # (build.config.msm.common:125)
+          #
+          # Deviation from the vendor gate, and why: upstream fails on ANY
+          # non-"+" line, because the vendor build never touches the config
+          # after the merge. We do one deliberate reduction (applied above),
+          # and turning CONFIG_UBSAN off makes its children invisible, so
+          # diffconfig reports "-UBSAN_BOOL n" for a symbol that was already
+          # unset and is merely no longer printed. That is not a dropped
+          # request.
+          #
+          # What must fail is a symbol that was requested ENABLED and did not
+          # survive: "-FOO y", "-FOO m" or "-FOO y -> m".
+          scripts/diffconfig "$MERGED_PATH" out/.config > "$MERGE_OUT" || true
+          DRIFT=$(grep -E '^-' "$MERGE_OUT" | grep -vE '^-[A-Za-z0-9_]+ n$' || true)
+          if [ -n "$DRIFT" ]; then
+            echo "========================================================"
+            echo "::error::Defconfig fragment did not apply as expected"
+            echo "$DRIFT"
+            echo "A symbol was requested enabled but olddefconfig dropped it --"
+            echo "almost always an unmet dependency or a conflicting choice."
+            exit 1
+          fi
+          IGNORED=$(grep -cE '^-[A-Za-z0-9_]+ n$' "$MERGE_OUT" || true)
+          echo "  [gate 3/3] every requested symbol took effect ($IGNORED unset-but-invisible symbols ignored)"
+          rm -f "$MERGE_OUT" "$VENDOR_BUILTIN" "$AUTOFDO_FRAGMENT"
+
+          # ---- feature status ----------------------------------------------
+          grep -q "^CONFIG_SYSVIPC=y" out/.config \
+            && echo "DROIDSPACES_STATUS=applied (SYSVIPC=y, kABI-safe)" >> $GITHUB_ENV \
+            || { echo "::error::CONFIG_SYSVIPC missing -- Droidspaces IPC unavailable"; exit 1; }
+
           if [ "${{ inputs.enable_susfs }}" = "true" ]; then
-            if grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
-              echo "SUSFS_STATUS=applied (CONFIG_KSU_SUSFS=y)" >> $GITHUB_ENV
-            else
-              echo "SUSFS_STATUS=patch applied but CONFIG_KSU_SUSFS was dropped" >> $GITHUB_ENV
-              echo "::warning::SUSFS patch landed but the Kconfig symbols are absent"
-              echo "::warning::the kernel builds fine, but SUSFS does nothing"
-            fi
+            grep -q "^CONFIG_KSU_SUSFS=y" out/.config \
+              && echo "SUSFS_STATUS=applied (CONFIG_KSU_SUSFS=y)" >> $GITHUB_ENV \
+              || { echo "::error::SUSFS symbols missing"; exit 1; }
           fi
 
-          # Guard rail: any OEM =m module that is still enabled will fail at
-          # modpost with an undefined vendor symbol. Catch it here (free) rather
-          # than after 25 minutes of compilation.
-          LEFTOVER=""
-          for m in $(grep -E '^CONFIG_[A-Za-z0-9_]+=m$' "$VENDOR_FRAGMENT" | sed 's/=m//'); do
-            grep -q "^${m}=m$" out/.config && LEFTOVER="$LEFTOVER $m"
-          done
-          if [ -n "$LEFTOVER" ]; then
-            echo "::warning::these OEM modules are enabled but cannot link in a GKI build:$LEFTOVER"
-            echo "::warning::modpost will fail with undefined vendor symbols"
+          if [ "$BTF_OFF" = "0" ]; then
+            # olddefconfig drops DEBUG_INFO_BTF silently if DEBUG_INFO_REDUCED
+            # (or PAHOLE_VERSION < 121) creeps back in, so assert it explicitly.
+            grep -q "^CONFIG_DEBUG_INFO_BTF=y" out/.config \
+              || { echo "::error::CONFIG_DEBUG_INFO_BTF was dropped"; exit 1; }
+            echo "BTF_STATUS=enabled (PAHOLE_VERSION=$(grep -m1 '^CONFIG_PAHOLE_VERSION=' out/.config | cut -d= -f2))" >> $GITHUB_ENV
+          else
+            echo "BTF_STATUS=disabled" >> $GITHUB_ENV
           fi
 
           echo "=== Key configs ==="
@@ -321,7 +468,9 @@ jobs:
             CONFIG_CFI_CLANG CONFIG_ZRAM_DEF_COMP CONFIG_OVERLAY_FS CONFIG_SECCOMP \
             CONFIG_NAMESPACES CONFIG_WIREGUARD CONFIG_AUTOFDO_CLANG CONFIG_MODVERSIONS \
             CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_PID_NS \
-            CONFIG_DEVTMPFS CONFIG_ANDROID_KABI_RESERVE; do
+            CONFIG_DEVTMPFS CONFIG_ANDROID_KABI_RESERVE \
+            CONFIG_DEBUG_INFO_BTF CONFIG_DEBUG_INFO_BTF_MODULES CONFIG_PAHOLE_VERSION \
+            CONFIG_MODULE_SIG_HASH CONFIG_MODULE_SIG_PROTECT; do
             val=$(grep "^${cfg}=" out/.config 2>/dev/null | cut -d= -f2)
             [ -n "$val" ] && echo "  $cfg=$val" || echo "  $cfg=NOT SET"
           done
@@ -429,14 +578,16 @@ jobs:
           |------|-------|
           | **Kernel** | Linux ${{ env.KERNEL_RELEASE }} (Xiaomi SM8735 / onyx GKI) |
           | **Clang** | ${{ env.CLANG_VERSION }} (linux-x86) |
-          | **Defconfig** | \`${{ env.DEFCONFIG }}\` |
-          | **Vendor modules** | ${{ inputs.enable_vendor_modules && 'onyx_perf.config merged' || 'skipped' }} |
+          | **Config base** | \`gki_defconfig\` + \`onyx_gki.fragment\` (+ vendor =y, + susfs) |
+          | **Config gates** | 3/3 passed (no overrides, no warnings, all fragments applied) |
+          | **Vendor modules** | ${{ inputs.enable_vendor_modules && 'onyx_perf.config =y entries merged' || 'skipped' }} |
           | **HZ** | 300 |
           | **LTO** | ThinLTO (FullLTO conflicts with KCFI) |
           | **ZRAM** | lz4 |
           | **ReSukiSU** | ${{ env.KSU_STATUS }} |
           | **SUSFS** | ${{ env.SUSFS_STATUS || 'disabled' }} |
           | **Droidspaces** | ${{ env.DROIDSPACES_STATUS }} |
+          | **BTF** | ${{ env.BTF_STATUS }} |
           | **AutoFDO** | ${{ env.AUTOFDO_STATUS }} |
           | **Modules built** | ${{ env.MODULES_BUILT }} |
           | **Artifact** | ${{ env.ZIP_NAME }} |

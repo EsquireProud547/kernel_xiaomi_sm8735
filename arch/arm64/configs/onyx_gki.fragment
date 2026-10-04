@@ -1,0 +1,62 @@
+#
+# onyx_gki.fragment - Capybara tuning layered onto the stock Android GKI base
+#
+# Synthesis order mirrors the official Kleaf mixed-build (build.config.msm.perf
+# + build.config.msm.common):
+#
+#   gki_defconfig                 (stock GKI 6.6.82 base, 786 lines)
+#     + onyx_gki.fragment         (this file: Capybara tuning)
+#     + vendor/onyx_perf.config   (=y entries only, filtered at build time)
+#     + onyx_susfs.fragment       (only when enable_susfs is true)
+#   -> merge_config.sh -m -r -y  -> make <defconfig>
+#
+# RULES for editing this file (they are enforced by the three gates that
+# build-onyx.yml replicates from build.config.msm.common):
+#
+#   1. Never set a symbol the base already has as =y or =m. merge_config
+#      reports it as an override and the build fails ("Detected overridden
+#      config!").
+#   2. Never set a symbol whose dependencies will not be met. olddefconfig
+#      drops it silently, the diffconfig gate then fails the build
+#      ("Defconfig fragment did not apply as expected").
+#
+# In short: every line here is a promise that the kernel will honour.
+#
+
+# --- Timer frequency -------------------------------------------------------
+# GKI default is HZ_250; the stock GKI fragment (which lives in the external
+# build/kernel repo and is NOT in this tree) is what normally picks the value.
+CONFIG_HZ_300=y
+
+# --- Link Time Optimization ------------------------------------------------
+# ThinLTO, not FullLTO: CONFIG_CFI_CLANG=y (KCFI) and FullLTO's type-id
+# reassignment conflict. See gki-clo commit 98763e396491 "Revert to ThinLTO:
+# FullLTO conflicts with KCFI type IDs". GKI base ships CONFIG_LTO_NONE=y.
+CONFIG_LTO_CLANG_THIN=y
+
+# --- zram compression ------------------------------------------------------
+# GKI default is lzo-rle. lz4 is materially faster to decompress, which is
+# what matters on the zram hot path under memory pressure.
+# CONFIG_CRYPTO_LZ4 is already =y in the GKI base, so the dependency holds.
+CONFIG_ZRAM_DEF_COMP_LZ4=y
+
+# --- Droidspaces (POSIX IPC for the container runtime) ---------------------
+# CONFIG_SYSVIPC requires .github/actions/droidspaces_sysvipc.patch: the plain
+# upstream config injects sysvsem/sysvshm into the middle of task_struct and
+# shifts every following field, which breaks vendor modules. The patch moves
+# them onto the ANDROID_KABI_RESERVE(6/7/8) padding instead.
+# CONFIG_ANDROID_KABI_RESERVE defaults to y (drivers/android/Kconfig), so the
+# union overlay keeps task_struct size and all trailing offsets unchanged.
+CONFIG_SYSVIPC=y
+CONFIG_POSIX_MQUEUE=y
+CONFIG_IPC_NS=y
+
+# --- Namespaces and container compatibility --------------------------------
+# PID_NS + devtmpfs are what a container runtime expects to exist.
+CONFIG_PID_NS=y
+CONFIG_DEVTMPFS=y
+
+# --- Optional but recommended: docker/proot compat + NixOS tmpfs ACLs ------
+CONFIG_USER_NS=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y

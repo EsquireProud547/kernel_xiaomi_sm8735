@@ -1,0 +1,47 @@
+From: nullptr-t-oss <127822226+nullptr-t-oss@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 09:18:23 +0000
+Subject: [PATCH] tools/lib/bpf: fix const-correctness of strchr() on a const path
+
+CONFIG_DEBUG_INFO_BTF pulls in tools/bpf/resolve_btfids (Makefile:1446
+"prepare: tools/bpf/resolve_btfids"), which links against tools/lib/bpf. That
+code no longer compiles with a current host compiler:
+
+  libbpf.c:11241: error: assigning to 'char *' from 'const char *' discards
+  qualifiers [-Werror,-Wincompatible-pointer-types-discards-qualifiers]
+       11241 |  next_path = strchr(s, ':');
+
+The signature of strchr() became const-correct in C23, and newer toolchains
+implement that for C17 code as a warning too. Since tools/lib/bpf/Makefile:89
+uses `override CFLAGS += -Werror -Wall`, it is a hard error and the build dies
+before a single line of BTF is produced.
+
+Command line workarounds do not survive this tree:
+  * HOSTCFLAGS=... is overridden by the `override CFLAGS +=` above.
+  * EXTRA_WARNINGS=-Wno-discarded-qualifiers does silence libbpf, but it is
+    also handed to objtool, which is compiled by clang, where that GCC-style
+    option name is unknown and -Werror turns it into a different failure.
+
+A cast is the portable fix. The buffer is written to by strchr()'s caller in
+the very next statement (the path is split out into result[]), so the object
+was never const anyway.
+
+Verified: resolve_btfids builds clean with no extra flags, and vmlinux ends up
+with .BTF, .BTF_ids and .debug_info sections.
+
+Signed-off-by: nullptr-t-oss <127822226+nullptr-t-oss@users.noreply.github.com>
+---
+ tools/lib/bpf/libbpf.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -11238,7 +11238,7 @@
+
+ 			if (s[0] == ':')
+ 				s++;
+-			next_path = strchr(s, ':');
++			next_path = (char *)strchr(s, ':');
+ 			seg_len = next_path ? next_path - s : strlen(s);
+ 			if (!seg_len)
+ 				continue;

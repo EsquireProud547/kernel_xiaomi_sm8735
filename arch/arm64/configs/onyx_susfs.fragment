@@ -1,0 +1,21 @@
+#
+# onyx_susfs.fragment - ReSukiSU + SUSFS, applied only when enable_susfs=true
+#
+# These symbols only exist once build-onyx.yml has applied the SUSFS patch
+# (susfs4ksu, branch gki-android15-6.6). If the patch fails, olddefconfig drops
+# every symbol here and the diffconfig gate fails the build -- which is the
+# intended behaviour: a silently dead SUSFS is worse than a failed build.
+#
+# NOTE on CONFIG_KSU_SUSFS_SUS_PATH: this is a *string* (the directory susfs
+# mounts are hidden in), not a bool. gki-clo appended every symbol with "=y"
+# in one loop, which set this path to the literal string "y". It is spelled
+# out separately here with a real path.
+#
+CONFIG_KSU=y
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_KSU_DENYLIST=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+CONFIG_KSU_SUSFS_SUS_PATH="/system/susfs"
