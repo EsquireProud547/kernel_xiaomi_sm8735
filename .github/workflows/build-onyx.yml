@@ -78,8 +78,14 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
-  actions: write
+  # This is a pure build: checkout, cache, ccache, compile, upload an artifact.
+  # Nothing here writes to the repository, and all four actions work with read
+  # only access. The previous "contents: write" was inherited from gki-clo and
+  # is a real exposure: the build pipes a third-party script straight into bash
+  # (`curl ... ReSukiSU/main/kernel/setup.sh | bash -s`) and clones a moving
+  # branch (susfs4ksu gki-android15-6.6). A poisoned dependency should not be
+  # able to push to this repo.
+  contents: read
 
 jobs:
   build:
@@ -402,14 +408,37 @@ jobs:
 
           # ---- build the merged defconfig, GATE 2: warnings are errors -----
           # (build.config.msm.common:105-112)
+          #
+          # PIPESTATUS is not optional here. `make | tee | tail` takes its exit
+          # status from tail, which is always 0, so a failed defconfig would
+          # sail through `set -e` and leave out/.config missing. Downstream
+          # that used to be caught only because diffconfig prints a usage
+          # example containing a line starting with "-", which the gate 3 grep
+          # happened to match -- i.e. the build failed for an unrelated reason
+          # and printed a confusing message.
+          set +e
           make O=out CC=clang LLVM=1 LLVM_IAS=1 "$MERGED_DEFCONFIG" 2>&1 | tee "$MERGE_OUT" | tail -5
+          MAKE_RC=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$MAKE_RC" -ne 0 ]; then
+            echo "========================================================"
+            echo "::error::make $MERGED_DEFCONFIG failed (exit $MAKE_RC)"
+            exit 1
+          fi
           if grep -q -e "warning:" "$MERGE_OUT"; then
             echo "========================================================"
             echo "::error::Treating config warnings as errors"
             grep -e "warning:" "$MERGE_OUT"
             exit 1
           fi
-          echo "  [gate 2/3] no kconfig warnings"
+          # Belt and braces: a successful make must have produced a config.
+          if [ ! -s out/.config ]; then
+            echo "========================================================"
+            echo "::error::make reported success but out/.config is missing or empty"
+            exit 1
+          fi
+          echo "  [gate 2/3] no kconfig warnings, out/.config produced"
 
           # No scripts/config edits from here on. Everything the kernel is
           # asked to do came from a fragment, which is what makes gate 3 below
@@ -428,7 +457,19 @@ jobs:
           #
           # What must fail is a symbol that was requested ENABLED and did not
           # survive: "-FOO y", "-FOO m" or "-FOO y -> m".
-          scripts/diffconfig "$MERGED_PATH" out/.config > "$MERGE_OUT" || true
+          #
+          # No `|| true` here. Note that diffconfig exits 0 even when it cannot
+          # read a file, so this guard is NOT what protects the missing-config
+          # case -- the `-s out/.config` assertion in gate 2 is. It is here to
+          # catch genuine tool errors (unreadable/corrupt file, malformed
+          # input), which would otherwise be indistinguishable from "no drift"
+          # and turn the gate into a silent pass.
+          if ! scripts/diffconfig "$MERGED_PATH" out/.config > "$MERGE_OUT"; then
+            echo "========================================================"
+            echo "::error::scripts/diffconfig failed"
+            cat "$MERGE_OUT"
+            exit 1
+          fi
           DRIFT=$(grep -E '^-' "$MERGE_OUT" | grep -vE '^-[A-Za-z0-9_]+ n$' || true)
           if [ -n "$DRIFT" ]; then
             echo "========================================================"
