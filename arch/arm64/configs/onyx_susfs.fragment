@@ -1,27 +1,40 @@
 #
 # onyx_susfs.fragment - ReSukiSU + SUSFS, applied only when enable_susfs=true
 #
-# These symbols only exist once build-onyx.yml has applied the SUSFS patch
-# (susfs4ksu, branch gki-android15-6.6). If the patch fails, olddefconfig drops
-# every symbol here and the diffconfig gate fails the build -- which is the
-# intended behaviour: a silently dead SUSFS is worse than a failed build.
+# These symbols only exist once build-onyx.yml has applied
+#   kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+# from susfs4ksu (branch gki-android15-6.6). If that fails, olddefconfig drops
+# both symbols below and gate 3 fails the build -- which is the intended
+# behaviour: a silently dead SUSFS is worse than a failed build.
 #
-# NOTE on CONFIG_KSU_SUSFS_SUS_PATH: it is a BOOL, not a string. An earlier
-# revision of this file set it to "/system/susfs" on the assumption that it
-# named the directory susfs mounts are hidden in; gate 2 rejected that:
-#   onyx_gki_defconfig:870:warning: symbol value '"/system/susfs"' invalid for
-#   KSU_SUSFS_SUS_PATH
-# Kconfig's only valid string syntax in a defconfig is CONFIG_X="value", so
-# that form being rejected means the symbol is not a string. gki-clo's
-# original "=y" for all eight symbols was correct after all. If a future
-# susfs4ksu revision does make this a string, gate 2 will say so again
-# rather than the build silently mis-configuring.
+# Only the two entry points are listed. Every sub-option of CONFIG_KSU_SUSFS is
+# "bool ... default y" in that Kconfig, so enabling the parent enables all ten:
+#
+#   KSU_SUSFS_SUS_PATH                   KSU_SUSFS_SPOOF_UNAME
+#   KSU_SUSFS_SUS_MOUNT                  KSU_SUSFS_ENABLE_LOG
+#   KSU_SUSFS_SUS_KSTAT                  KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+#   KSU_SUSFS_OPEN_REDIRECT              KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+#   KSU_SUSFS_SUS_MAP
+#
+# gki-clo instead appended eight symbols in a blind loop. Three of them --
+# KSU_SUSFS_HAS_MAGIC_MOUNT,
+# KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_KSU_DENYLIST and
+# KSU_SUSFS_SUS_OVERLAYFS -- do not exist on this branch at all, and gate 3
+# rejected them:
+#   -KSU_SUSFS_HAS_MAGIC_MOUNT y
+#   -KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_KSU_DENYLIST y
+#   -KSU_SUSFS_SUS_OVERLAYFS y
+#
+# CONFIG_KSU_SUSFS_SUS_PATH is a bool, not a string. An earlier revision here
+# set it to "/system/susfs" and gate 2 rejected that with
+#   warning: symbol value '"/system/susfs"' invalid for KSU_SUSFS_SUS_PATH
+#
+# Both mistakes came from configuring symbols this repository cannot see.
+# Keeping the fragment to the two symbols whose semantics are actually known
+# makes it immune to the next susfs4ksu rename.
+#
+# config KSU_SUSFS depends on KSU and THREAD_INFO_IN_TASK. The latter is
+# already =y in the stock gki_defconfig; KSU is set below.
 #
 CONFIG_KSU=y
 CONFIG_KSU_SUSFS=y
-CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
-CONFIG_KSU_SUSFS_SUS_MOUNT=y
-CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_KSU_DENYLIST=y
-CONFIG_KSU_SUSFS_SUS_KSTAT=y
-CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
-CONFIG_KSU_SUSFS_SUS_PATH=y

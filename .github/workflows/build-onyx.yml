@@ -401,6 +401,19 @@ jobs:
                               -d CONFIG_MODULE_ALLOW_BTF_MISMATCH"
           fi
 
+          # gki_defconfig line 1 is CONFIG_UAPI_HEADER_TEST=y, but that symbol
+          # is `depends on HEADERS_INSTALL && CC_CAN_LINK` (init/Kconfig:191)
+          # and CC_CAN_LINK is a compile-probe result that no defconfig line can
+          # satisfy. It survives with the toolchain the vendor build uses, and
+          # is dropped with ours, which gate 3 reports as a dropped request.
+          #
+          # It is a developer-only option -- "If you are a developer or tester
+          # and want to ensure the exported headers are self-contained" -- that
+          # recompiles every UAPI header standalone. There is nothing to gain
+          # from it in a shipping kernel and it costs build time, so drop the
+          # request rather than weakening the gate.
+          OVERRIDE_ARGS="$OVERRIDE_ARGS -d CONFIG_UAPI_HEADER_TEST"
+
           if [ -n "$OVERRIDE_ARGS" ]; then
             # shellcheck disable=SC2086
             scripts/config --file "$MERGED_PATH" $OVERRIDE_ARGS
