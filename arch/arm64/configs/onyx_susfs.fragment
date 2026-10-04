@@ -6,10 +6,16 @@
 # every symbol here and the diffconfig gate fails the build -- which is the
 # intended behaviour: a silently dead SUSFS is worse than a failed build.
 #
-# NOTE on CONFIG_KSU_SUSFS_SUS_PATH: this is a *string* (the directory susfs
-# mounts are hidden in), not a bool. gki-clo appended every symbol with "=y"
-# in one loop, which set this path to the literal string "y". It is spelled
-# out separately here with a real path.
+# NOTE on CONFIG_KSU_SUSFS_SUS_PATH: it is a BOOL, not a string. An earlier
+# revision of this file set it to "/system/susfs" on the assumption that it
+# named the directory susfs mounts are hidden in; gate 2 rejected that:
+#   onyx_gki_defconfig:870:warning: symbol value '"/system/susfs"' invalid for
+#   KSU_SUSFS_SUS_PATH
+# Kconfig's only valid string syntax in a defconfig is CONFIG_X="value", so
+# that form being rejected means the symbol is not a string. gki-clo's
+# original "=y" for all eight symbols was correct after all. If a future
+# susfs4ksu revision does make this a string, gate 2 will say so again
+# rather than the build silently mis-configuring.
 #
 CONFIG_KSU=y
 CONFIG_KSU_SUSFS=y
@@ -18,4 +24,4 @@ CONFIG_KSU_SUSFS_SUS_MOUNT=y
 CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_KSU_DENYLIST=y
 CONFIG_KSU_SUSFS_SUS_KSTAT=y
 CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
-CONFIG_KSU_SUSFS_SUS_PATH="/system/susfs"
+CONFIG_KSU_SUSFS_SUS_PATH=y
