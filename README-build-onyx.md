@@ -40,15 +40,39 @@ gki-clo 在 CI 里用 20 行 `sed` 改 `capybara_defconfig` 文本。这套方�
 - Droidspaces 配置块：`SYSVIPC` `POSIX_MQUEUE` `IPC_NS` `PID_NS` `DEVTMPFS`
   `NETFILTER_XT_MATCH_ADDRTYPE` `USER_NS` `TMPFS_POSIX_ACL`
 
-### 2. 合入 Xiaomi vendor 模块
+### 2. 合入 Xiaomi vendor 模块（只取 `=y`）
 
 CI 里用 `scripts/kconfig/merge_config.sh` 合入 `arch/arm64/configs/vendor/onyx_perf.config`
 （就是厂商构建 `build.config.msm.perf` 里 `apply_defconfig_fragment` 用的那份），
-可由 `enable_vendor_modules` 关闭。实测 22~34 个 `MI_*` / `XM_*` / `MCA_*` 符号全部解析为 `=m`。
+可由 `enable_vendor_modules` 关闭。
 
-> 注意：这些 OEM 模块构建出来后**不会**打进刷机包 —— 放进 AnyKernel3 需要重打
-> `vendor_dlkm`，超出范围。它们的作用是让 GKI 配置面更接近厂商预期。
-> 需要拿到 `.ko` 做手动测试时，打开 `bundle_modules`（会放进 zip 的 `modules/`，不参与刷写）。
+**只合入 `=y` 的 4 个条目**（`INPUT_FINGERPRINT` / `FOD_FINGERPRINT` /
+`JOYSTICK_XPAD_FF` / `JOYSTICK_XPAD_LEDS`），`=m` 的 33 个 OEM 模块**故意不编译**：
+
+```
+ERROR: modpost: "qcom_smem_alloc" [drivers/power/supply/mca/.../mca_qcom_smem.ko] undefined!
+ERROR: modpost: "pwrkey_irq_notifier_list" [drivers/mtd/mtdoops.ko] undefined!
+```
+
+原因是这些 OEM 模块链接的是 **vendor（msm-kernel）镜像导出的符号**，而那个镜像不在
+本仓库里：
+
+| 符号 | 定义处 | 需要 | GKI 配置里有吗 |
+|---|---|---|---|
+| `qcom_smem_alloc` | `drivers/soc/qcom/smem.c:521` | `CONFIG_QCOM_SMEM` | ❌ |
+| `pwrkey_irq_notifier_list` | `drivers/input/misc/pm8941-pwrkey.c:93` | `CONFIG_INPUT_PM8941_PWRKEY`（`depends on MFD_SPMI_PMIC`） | ❌ |
+
+厂商用的是 mixed-build：这些模块在 vendor 内核里编译，对着 KMI 符号表链接。
+单树 GKI 构建做不到，所以只能不编。
+
+**丢弃它们没有任何损失**：这些模块本来就不会被打进刷机包 —— 放进 AnyKernel3 需要重打
+`vendor_dlkm`，超出范围。设备用的是 `vendor_dlkm` 里的原厂模块，我们只需要 `=y` 的那几项
+（它们真的会进 Image）。过滤规则是从 fragment 动态推导的，小米以后加条目也不用改代码。
+
+> 已在 Configure 步骤加了护栏：若将来 fragment 里某个 `=m` 条目又被启用，会在编译前
+> 打出 `::warning::`，而不是等 25 分钟编译完才在 modpost 炸掉。
+
+需要拿到 `.ko` 做手动测试时，打开 `bundle_modules`（会放进 zip 的 `modules/`，不参与刷写）。
 
 ### 3. Droidspaces kABI 补丁按 6.6.82 重生成
 

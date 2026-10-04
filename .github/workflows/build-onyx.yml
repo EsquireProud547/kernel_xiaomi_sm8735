@@ -198,13 +198,54 @@ jobs:
           # already lives in onyx_defconfig -- nothing to sed here.
           make O=out CC=clang LLVM=1 LLVM_IAS=1 "$DEFCONFIG"
 
-          # Xiaomi OEM modules from the in-tree vendor fragment. These are the
-          # same fragment the vendor build applies (build.config.msm.perf ->
+          # Xiaomi OEM bits from the in-tree vendor fragment. These are the same
+          # fragment the vendor build applies (build.config.msm.perf ->
           # apply_defconfig_fragment vendor/onyx_perf.config).
+          #
+          # Only the "=y" entries are merged. The 33 "=m" entries are OEM
+          # modules that link against symbols exported by the vendor
+          # (msm-kernel) image, which does not exist in a single-tree GKI
+          # build. Merging them makes modpost fail with:
+          #   ERROR: modpost: "qcom_smem_alloc" [...mca_qcom_smem.ko] undefined!
+          #   ERROR: modpost: "pwrkey_irq_notifier_list" [...mtdoops.ko] undefined!
+          # (qcom_smem_alloc needs CONFIG_QCOM_SMEM, pwrkey_irq_notifier_list
+          # needs CONFIG_INPUT_PM8941_PWRKEY -- neither exists in a GKI config.)
+          #
+          # Dropping them costs nothing: they are never packaged anyway (the
+          # device loads the stock ones from vendor_dlkm), so we only need the
+          # "=y" entries that actually land in the Image. Deriving the filter
+          # from the fragment keeps this correct if Xiaomi adds entries later.
           if [ "${{ inputs.enable_vendor_modules }}" = "true" ]; then
-            echo "Merging $VENDOR_FRAGMENT ..."
-            ./scripts/kconfig/merge_config.sh -m -O out out/.config "$VENDOR_FRAGMENT" \
-              | sed 's/^/  /' || true
+            echo "Merging built-in (=y) entries from $VENDOR_FRAGMENT ..."
+            VENDOR_BUILTIN="$(mktemp)"
+            grep -E '^CONFIG_[A-Za-z0-9_]+=y$' "$VENDOR_FRAGMENT" | tee "$VENDOR_BUILTIN" | sed 's/^/  /'
+            if [ -s "$VENDOR_BUILTIN" ]; then
+              ./scripts/kconfig/merge_config.sh -m -O out out/.config "$VENDOR_BUILTIN" \
+                | sed 's/^/  /' || true
+            fi
+            rm -f "$VENDOR_BUILTIN"
+            echo "  (skipped $(grep -cE '^CONFIG_[A-Za-z0-9_]+=m$' "$VENDOR_FRAGMENT") OEM =m modules:"
+            echo "   they need vendor-image symbols and are not packaged)"
+          fi
+
+          # ReSukiSU + SUSFS config. This must live here (not in the defconfig)
+          # because it is conditional on inputs.enable_susfs, and because the
+          # symbols only exist once the SUSFS patch has been applied.
+          #
+          # NOTE: gki-clo appended all of these with "=y", including
+          # CONFIG_KSU_SUSFS_SUS_PATH -- but SUS_PATH is a *string* (the
+          # directory susfs mounts are hidden in), so "=y" made the path
+          # literally "y". It is set properly below.
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            scripts/config --file out/.config \
+              -e CONFIG_KSU -e CONFIG_KSU_SUSFS \
+              -e CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT \
+              -e CONFIG_KSU_SUSFS_SUS_MOUNT \
+              -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_KSU_DENYLIST \
+              -e CONFIG_KSU_SUSFS_SUS_KSTAT \
+              -e CONFIG_KSU_SUSFS_SUS_OVERLAYFS
+            scripts/config --file out/.config \
+              --set-str CONFIG_KSU_SUSFS_SUS_PATH "/system/susfs"
           fi
 
           # AutoFDO (non-fatal: the +archive endpoint 5xx when no profile is built)
@@ -250,6 +291,31 @@ jobs:
             echo "::warning::CONFIG_SYSVIPC was dropped -- Droidspaces IPC unavailable"
           fi
 
+          # SUSFS: the patch landing is not enough, the symbols must survive
+          # olddefconfig too. Verified here so a silent no-op can never again
+          # masquerade as a working feature.
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            if grep -q "^CONFIG_KSU_SUSFS=y" out/.config; then
+              echo "SUSFS_STATUS=applied (CONFIG_KSU_SUSFS=y)" >> $GITHUB_ENV
+            else
+              echo "SUSFS_STATUS=patch applied but CONFIG_KSU_SUSFS was dropped" >> $GITHUB_ENV
+              echo "::warning::SUSFS patch landed but the Kconfig symbols are absent"
+              echo "::warning::the kernel builds fine, but SUSFS does nothing"
+            fi
+          fi
+
+          # Guard rail: any OEM =m module that is still enabled will fail at
+          # modpost with an undefined vendor symbol. Catch it here (free) rather
+          # than after 25 minutes of compilation.
+          LEFTOVER=""
+          for m in $(grep -E '^CONFIG_[A-Za-z0-9_]+=m$' "$VENDOR_FRAGMENT" | sed 's/=m//'); do
+            grep -q "^${m}=m$" out/.config && LEFTOVER="$LEFTOVER $m"
+          done
+          if [ -n "$LEFTOVER" ]; then
+            echo "::warning::these OEM modules are enabled but cannot link in a GKI build:$LEFTOVER"
+            echo "::warning::modpost will fail with undefined vendor symbols"
+          fi
+
           echo "=== Key configs ==="
           for cfg in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_HZ CONFIG_LTO_CLANG_THIN \
             CONFIG_CFI_CLANG CONFIG_ZRAM_DEF_COMP CONFIG_OVERLAY_FS CONFIG_SECCOMP \
@@ -267,17 +333,33 @@ jobs:
           export CCACHE_DIR="$PWD/.ccache"
 
           JOBS=$(nproc --all 2>/dev/null || echo 16)
-          make -j"$JOBS" O=out CC="ccache clang" LLVM=1 LLVM_IAS=1 KCFLAGS="-w" 2>&1 | tee build.log
 
-          if [ -f "out/arch/arm64/boot/Image" ]; then
+          # PIPESTATUS[0] is make's real exit code. Without this, a pipeline
+          # into tee always reports success -- and because arm64 builds Image
+          # *after* modpost, a warm-cache re-run that has a stale Image in out/
+          # would sail through the check below and claim SUCCESSFUL.
+          set +e
+          make -j"$JOBS" O=out CC="ccache clang" LLVM=1 LLVM_IAS=1 KCFLAGS="-w" 2>&1 | tee build.log
+          MAKE_RC=${PIPESTATUS[0]}
+          set -e
+          echo "make exit code: $MAKE_RC"
+
+          if [ "$MAKE_RC" -eq 0 ] && [ -f "out/arch/arm64/boot/Image" ]; then
             echo "Build SUCCESSFUL"
             KREL=$(cat out/include/config/kernel.release 2>/dev/null || echo unknown)
             echo "KERNEL_RELEASE=$KREL" >> $GITHUB_ENV
             strings out/arch/arm64/boot/Image | grep 'Linux version' | head -1
             echo "MODULES_BUILT=$(find out -name '*.ko' | wc -l)" >> $GITHUB_ENV
           else
-            echo "Build FAILED"
-            tail -60 build.log
+            echo "Build FAILED (make exit=$MAKE_RC)"
+            # Surface the real cause instead of just the last 60 lines: modpost
+            # symbol errors can be hundreds of lines above the make error tail.
+            echo "--- errors ---"
+            grep -nE "ERROR:|error:|undefined!|No rule to make|Stop\." build.log | head -30 || true
+            echo "--- tail ---"
+            tail -40 build.log
+            # Keep the log as an artifact so a failed run is diagnosable without
+            # re-downloading the whole 400KB console log.
             exit 1
           fi
 
