@@ -228,8 +228,53 @@ BTF 来自改了 HZ/LTO/Droidspaces 的内核，结构体布局必然有差异�
 
 ## AnyKernel3
 
-已更新到上游 **`020dfec`（2026-09-04，"tools: update magisk utils to v31.0 beta"）**。
-更新前那份来自 gki-clo，工具整体偏旧且体积偏大。
+脚本已更新到上游 **`020dfec`（2026-09-04，"tools: update magisk utils to v31.0 beta"）**。
+更新前那份来自 gki-clo。
+
+> ⚠️ **二进制必须保持 aarch64，不能从上游 master 更新。** 详见
+> [anykernel/AK3-NOTES.md](anykernel/AK3-NOTES.md)。
+
+### ⚠️ 上游 master 只装 32 位 ARM —— 这个坑踩过一次
+
+上游 README 明说：
+
+> "The AK3 repo includes current **ARM builds** … Builds for **other
+> architectures** … are available from the latest Magisk zip, or my latest
+> AIK-mobile and FlashIt packages"
+
+一次性把 `tools/` 全部换成上游版本后，**7 个二进制从 aarch64 全变成 32 位 ARM**：
+
+| 工具 | 更新前 | 更新后（上游 master） |
+|---|---|---|
+| busybox / magiskboot / magiskpolicy | **aarch64** | ARM 32-bit |
+| fec / httools_static / lptools_static / snapshotupdater_static | **aarch64** | ARM 32-bit |
+
+SM8735 是 Oryon 核心，**不支持 AArch32**，32 位 ARM 二进制直接 `exec format
+error`。在 KSU 管理器里的表现尤其明确——BakaSU 内置 AK3 刷入器
+（`userspace/ksud/src/anykernel3.rs`）会在 `update-binary` 的
+`chmod -R 755 tools bin;` 锚点前注入：
+
+```sh
+cp -f '<BIN>/mkbootfs' "$AKHOME/tools/mkbootfs" || exit 1;
+```
+
+该锚点在 `setup_bb()` 里位于 `$bb ` 之后，所以注入后展开成：
+
+```sh
+$bb cp -f ... || exit 1;
+```
+
+`$bb` 就是 `tools/busybox`。32 位 busybox 无法执行 → `|| exit 1` 立刻触发 →
+**刷入中止**。
+
+**修复**：脚本保持新版，7 个二进制恢复为 aarch64。兼容性已核对——新版
+`ak3-core.sh` 调用的 magiskboot 子命令是旧版的**子集**（少了 `magiskboot
+supports`），所以旧 aarch64 二进制完全够用。
+
+刷新 aarch64 二进制的正确来源是 Magisk release 或 osm0sis 的 AIK-mobile /
+FlashIt 包，更新后务必 `file tools/*` 确认每项都是 `ARM aarch64`。注意上游
+`setup_bb()` 的架构探测只找 `tools/x86` 和 `tools/arm`，**没有 `tools/arm64`
+分支**，所以 aarch64 二进制必须直接放在 `tools/` 下。
 
 ### 为什么不只是换工具
 
@@ -259,13 +304,13 @@ BTF 来自改了 HZ/LTO/Droidspaces 的内核，结构体布局必然有差异�
 zip -r9 UPDATE-AnyKernel3.zip * -x .git README.md *placeholder
 ```
 
-- **`README.md` 排除** —— 上游文档，刷机时无用途（16.5 KB）
+- **`*.md` 排除** —— 上游 `README.md` 与本仓库的 `AK3-NOTES.md`，都是开发文档，刷机时无用途
 - **`*placeholder` 排除** —— 只是为了让空目录能进 git；**目录本身必须保留**，
   `ak3-core.sh` 期望解包后存在 `ramdisk/` 和 `patch/`
 - **`LICENSE` 保留** —— 上游明确要求："must remain in the final zip to comply with
   licenses for binary redistribution and the license of the AK3 scripts"
 
-最终包内 24 项，含 `Image.gz`、`anykernel.sh`、`LICENSE`、`META-INF/`、`tools/`。
+最终包内 23 项，含 `Image.gz`、`anykernel.sh`、`LICENSE`、`META-INF/`、`tools/`。
 
 ### 设备适配
 

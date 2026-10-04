@@ -628,14 +628,15 @@ jobs:
           # Upstream's own packaging command (AnyKernel3 README, "Building"
           # step 5): zip -r9 UPDATE-AnyKernel3.zip * -x .git README.md *placeholder
           #
-          #   README.md    upstream documentation, nothing on-device needs it
+          #   *.md         upstream README.md plus our AK3-NOTES.md; both are
+          #                developer documentation, nothing on-device needs them
           #   *placeholder only exist to keep empty dirs in git; the dirs
           #                themselves must stay (ak3-core.sh expects ramdisk/
           #                and patch/ to exist after extraction)
           #   LICENSE      deliberately KEPT -- upstream: "must remain in the
           #                final zip to comply with licenses for binary
           #                redistribution and the license of the AK3 scripts"
-          zip -r9 "../$ZIP_NAME" ./* -x 'README.md' '*placeholder'
+          zip -r9 "../$ZIP_NAME" ./* -x '*.md' '*placeholder'
           cd ..
 
           rm -rf "$TEMP_DIR"
