@@ -1,35 +1,33 @@
 name: Build Onyx Kernel
 
-# Ported from gki-clo/.github/workflows/build-capybara.yml (Capybara CLO 6.6.77)
-# onto the Xiaomi SM8735 "onyx" GKI 6.6.82 tree.
+# Builds a Capybara-tuned Xiaomi SM8735 (onyx) GKI 6.6.82 kernel and packages
+# it as a flashable AnyKernel3 zip. Ported from gki-clo's build-capybara.yml.
 #
-# Reused verbatim: runner/swap/cleanup, deps, Clang fetch+cache, ccache
-# layering, ReSukiSU, SUSFS + fixup, Droidspaces kABI patch, build command,
-# AnyKernel3 packaging, artifact upload.
+# Reused from gki-clo: runner/swap/cleanup, dependency list, Clang fetch+cache,
+# three-tier ccache keys, ReSukiSU, SUSFS + fixup, Droidspaces kABI patch, the
+# build command, AnyKernel3 packaging and artifact upload.
 #
-# Config synthesis now follows the STOCK Kleaf mixed-build instead of a
-# hand-baked defconfig:
+# What differs from gki-clo, and why:
 #
-#   gki_defconfig  +  onyx_gki.fragment  +  vendor/onyx_perf.config (=y only)
-#                  +  onyx_susfs.fragment (conditional)
-#   --merge_config.sh -m -r -y-->  make <defconfig>
+#   * Config synthesis follows the STOCK Kleaf mixed-build (build.config.msm.perf
+#     + build.config.msm.common) instead of a hand-baked defconfig:
+#         gki_defconfig + onyx_gki.fragment + vendor/onyx_perf.config (=y only)
+#                     + onyx_susfs.fragment + onyx_autofdo.fragment
+#         --merge_config.sh -m -r -y-->  make onyx_gki_defconfig
+#     with the same three gates, so a fragment that does not take effect fails
+#     the build instead of silently disabling a feature. See the Configure step
+#     for the two places this deliberately diverges from upstream.
 #
-# with the same three gates build.config.msm.common applies, so a fragment that
-# does not take effect fails the build instead of silently disabling a feature.
+#   * Using the stock GKI base also repaired three problems that the earlier
+#     hand-baked onyx_defconfig (now removed) had, all seen in CI output:
+#       - BTF was silently off (CONFIG_DEBUG_INFO_REDUCED=y blocks it).
+#       - MODULE_SIG_SHA1 instead of SHA-512, and no MODULE_SIG_PROTECT.
+#       - The debug reduction disabled PROFILING, which cascaded into removing
+#         BPF_LSM, all hardware performance counters and uprobe support.
 #
-# This also fixes three things the baked defconfig had wrong:
-#   * BTF. The stock GKI base ships CONFIG_DEBUG_INFO_BTF=y; the baked
-#     defconfig had set CONFIG_DEBUG_INFO_REDUCED=y, which is a hard blocker
-#     (lib/Kconfig.debug: DEBUG_INFO_BTF depends on !DEBUG_INFO_REDUCED) and
-#     was dropping BTF with no warning at all.
-#   * Module signature hash. Baked defconfig said MODULE_SIG_SHA1, the GKI base
-#     says MODULE_SIG_SHA512. They are mutually exclusive (a `choice`), and
-#     stock vendor modules are signed with SHA-512.
-#   * CONFIG_MODULE_SIG_PROTECT=y, which is what lets the GKI load modules
-#     whose signature it cannot verify.
+#   * permissions is contents: read; nothing here writes to the repository.
 #
-# BBRv3 / NTSYNC / Baseband-guard are still not ported: 6.6.82 has no
-# net/ipv4/tcp_bbr3.c, no drivers/misc/ntsync.c, no security/baseband-guard.
+# Not ported: BBRv3, NTSYNC, Baseband-guard (absent from 6.6.82).
 
 env:
   CLANG_VERSION: clang-r596125
@@ -295,11 +293,23 @@ jobs:
           #   ERROR: modpost: "qcom_smem_alloc" [...mca_qcom_smem.ko] undefined!
           #   ERROR: modpost: "pwrkey_irq_notifier_list" [...mtdoops.ko] undefined!
           # (qcom_smem_alloc needs CONFIG_QCOM_SMEM, pwrkey_irq_notifier_list
-          # needs CONFIG_INPUT_PM8941_PMRKEY -- neither exists in a GKI config.)
+          # needs CONFIG_INPUT_PM8941_PKEY -- neither exists in a GKI config.)
+          # The vendor builds these in the vendor kernel against the KMI symbol
+          # list; a single-tree GKI build cannot.
+          #
           # They are never packaged anyway -- the device loads the stock ones
-          # from vendor_dlkm -- so only the "=y" entries, which really do reach
-          # the Image, are merged. Derived from the fragment so it stays
-          # correct if Xiaomi adds entries.
+          # from vendor_dlkm -- so only the "=y" entries are merged. The filter
+          # is derived from the fragment so it stays correct if Xiaomi adds
+          # entries.
+          #
+          # Known limitation: the filter is coarse. Of the four "=y" entries,
+          # JOYSTICK_XPAD_FF and JOYSTICK_XPAD_LEDS are real (JOYSTICK_XPAD is
+          # a stock in-tree driver, built in), but INPUT_FINGERPRINT and
+          # FOD_FINGERPRINT are inert shells: the driver that uses them is
+          # CONFIG_FINGERPRINT_MI_FP=m, which this filter drops. That driver
+          # does link on its own (verified locally, exit 0), so it could be
+          # allow-listed here -- but each allow-listed module must be checked to
+          # link, since one that does not fails the whole build at modpost.
           VENDOR_BUILTIN=""
           if [ "${{ inputs.enable_vendor_modules }}" = "true" ]; then
             VENDOR_BUILTIN="vendor_builtin.fragment"
@@ -310,10 +320,11 @@ jobs:
           fi
 
           # ---- BTF ---------------------------------------------------------
-          # The stock GKI base already ships CONFIG_DEBUG_INFO_BTF=y, which is
-          # why the old baked defconfig lost it: its CONFIG_DEBUG_INFO_REDUCED=y
+          # The stock GKI base ships CONFIG_DEBUG_INFO_BTF=y, so nothing has to
+          # add it. Do not be tempted to set CONFIG_DEBUG_INFO_REDUCED=y: that
           # blocks BTF outright (lib/Kconfig.debug: DEBUG_INFO_BTF depends on
-          # !DEBUG_INFO_REDUCED) and olddefconfig dropped it with no warning.
+          # !DEBUG_INFO_REDUCED) and olddefconfig drops BTF with no warning at
+          # all -- which is exactly how it went missing before.
           #
           # Turning BTF *off* is a deliberate override, not a fragment: the base
           # has it as =y, so a fragment saying =n would trip gate 1. It is
@@ -561,8 +572,6 @@ jobs:
             grep -nE "ERROR:|error:|undefined!|No rule to make|Stop\." build.log | head -30 || true
             echo "--- tail ---"
             tail -40 build.log
-            # Keep the log as an artifact so a failed run is diagnosable without
-            # re-downloading the whole 400KB console log.
             exit 1
           fi
 
@@ -586,6 +595,11 @@ jobs:
             cp -v "$ZIMAGE_DIR"/dts/vendor/qcom/*.dtb "$TEMP_DIR/dtb/" 2>/dev/null || true
             cp -v "$ZIMAGE_DIR"/dts/vendor/qcom/*.dtbo "$TEMP_DIR/dtb/" 2>/dev/null || true
           fi
+          # The branch above is currently inert: this tree has no SM8735/onyx
+          # dtsi (arch/arm64/boot/dts/qcom holds 381 legacy SoC trees), so the
+          # device takes its device tree from the vendor side. Kept because it
+          # becomes live the moment a DTS-capable tree is used, and dropping it
+          # would silently lose the dtb/ on that day.
 
           # Opt-in: hand the OEM modules to the zip. They are NOT flashed by
           # AnyKernel3 (that would need a vendor_dlkm repack) -- this is for
@@ -597,17 +611,31 @@ jobs:
 
           VERSION="${{ inputs.version != '' && inputs.version || github.run_number }}"
           KREL="${{ env.KERNEL_RELEASE }}"
-          KS="${{ env.KERNEL_CODENAME }} CLO Kernel v${VERSION} (Linux ${KREL})"
+          KS="${{ env.KERNEL_CODENAME }} Kernel v${VERSION} (Linux ${KREL})"
 
           # Stamp the real version into the flash script so the on-device banner
-          # can never go stale (gki-clo shipped a hardcoded "6.2" here forever).
+          # can never go stale (gki-clo shipped a hardcoded kernel.string here
+          # forever). META-INF/.../update-binary does
+          #   KERNEL_STRING="$(file_getprop anykernel.sh kernel.string)"
+          #   ui_print "$KERNEL_STRING"
+          # so this one line is the whole banner -- there is no separate
+          # ui_print line to patch.
           sed -i "s|^kernel.string=.*|kernel.string=${KS}|" "$TEMP_DIR/anykernel.sh"
-          sed -i "s|^ui_print \"Flashing .*|ui_print \"Flashing ${KS}...\"|" "$TEMP_DIR/anykernel.sh"
-          grep -E "^kernel.string=|^ui_print \"Flashing" "$TEMP_DIR/anykernel.sh" | sed 's/^/  /'
+          grep -E "^kernel.string=" "$TEMP_DIR/anykernel.sh" | sed 's/^/  /'
 
           ZIP_NAME="${{ env.KERNEL_CODENAME }}-Kernel-v${VERSION}-$(date +%Y%m%d).zip"
           cd "$TEMP_DIR"
-          zip -r9 "../$ZIP_NAME" ./*
+          # Upstream's own packaging command (AnyKernel3 README, "Building"
+          # step 5): zip -r9 UPDATE-AnyKernel3.zip * -x .git README.md *placeholder
+          #
+          #   README.md    upstream documentation, nothing on-device needs it
+          #   *placeholder only exist to keep empty dirs in git; the dirs
+          #                themselves must stay (ak3-core.sh expects ramdisk/
+          #                and patch/ to exist after extraction)
+          #   LICENSE      deliberately KEPT -- upstream: "must remain in the
+          #                final zip to comply with licenses for binary
+          #                redistribution and the license of the AK3 scripts"
+          zip -r9 "../$ZIP_NAME" ./* -x 'README.md' '*placeholder'
           cd ..
 
           rm -rf "$TEMP_DIR"
