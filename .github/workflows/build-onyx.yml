@@ -1,0 +1,363 @@
+name: Build Onyx Kernel
+
+# Ported from gki-clo/.github/workflows/build-capybara.yml (Capybara CLO 6.6.77)
+# onto the Xiaomi SM8735 "onyx" GKI 6.6.82 tree.
+# What is reused verbatim: runner/swap/cleanup, deps, Clang fetch+cache, ccache
+# layering, ReSukiSU, SUSFS + fixup, Droidspaces kABI patch, build, AnyKernel3,
+# artifact upload. What changed and why:
+#   * config tuning (HZ300/ThinLTO/ZRAM-LZ4/Droidspaces) is BAKED INTO
+#     onyx_defconfig instead of 20 lines of `sed` on the defconfig text.
+#     The sed approach silently no-ops when a "# CONFIG_X is not set" line is
+#     absent -- e.g. "# CONFIG_LTO_CLANG_THIN is not set" does not even exist
+#     unless the compiler satisfies HAS_LTO_CLANG.
+#   * Xiaomi vendor modules are merged in from vendor/onyx_perf.config.
+#   * BBRv3 / NTSYNC / Baseband-guard are intentionally NOT ported yet (the
+#     6.6.82 tree has no tcp_bbr3.c, no drivers/misc/ntsync.c, no
+#     security/baseband-guard). See arch/arm64/configs/onyx_defconfig header.
+#   * The build summary now reports what actually happened instead of always
+#     claiming success.
+
+env:
+  CLANG_VERSION: clang-r596125
+  CLANG_BRANCH: android17-release
+  DEFCONFIG: onyx_defconfig
+  VENDOR_FRAGMENT: arch/arm64/configs/vendor/onyx_perf.config
+  KERNEL_CODENAME: Onyx
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_susfs:
+        description: "Enable SUSFS (hide root traces)"
+        type: boolean
+        default: true
+      ksu_branch:
+        description: "ReSukiSU branch (leave empty = main)"
+        type: string
+        default: "main"
+      version:
+        description: "Custom version name (optional)"
+        type: string
+        default: ""
+      enable_vendor_modules:
+        description: "Merge Xiaomi onyx vendor modules into the GKI config"
+        type: boolean
+        default: true
+      enable_autofdo:
+        description: "Use the upstream GKI AutoFDO profile (non-fatal if unavailable)"
+        type: boolean
+        default: true
+      bundle_modules:
+        description: "Also put built .ko files into the zip under modules/ (not flashed)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    name: onyx-${{ inputs.enable_susfs == true && 'susfs' || 'clean' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v7
+        with:
+          # This repo's only branch is `oss` (origin/HEAD -> refs/heads/oss).
+          # gki-clo uses `main`; do not copy that over.
+          ref: oss
+          fetch-depth: 0
+
+      - name: Fast cleanup + swap
+        run: |
+          # Aggressive disk cleanup (make room for kernel src + 20GB swap)
+          sudo rm -rf \
+            /usr/share/dotnet /usr/local/share/powershell \
+            /opt/hostedtoolcache/go /usr/local/lib/android \
+            /usr/share/swift /usr/local/share/boost 2>/dev/null || true
+          sudo apt-get remove -y -qq 2>/dev/null \
+            dotnet* aspnetcore* netstandard* mono* ^llvm-.* ^lld-.*  || true
+          sudo apt-get autoremove -y -qq 2>/dev/null || true
+          df -h /
+
+          # Always recreate swap: runner images may already ship an active one
+          # and a bare `if` check misses that (see gki-clo 18e63ee0098f).
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /swapfile /mnt/swapfile 2>/dev/null || true
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=20480 status=progress
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ccache flex bison libncurses-dev libssl-dev libelf-dev \
+            cpio wget curl jq git zip unzip bc \
+            gcc g++ make device-tree-compiler python3
+
+      - name: Cache Clang toolchain
+        id: cache-clang
+        uses: actions/cache@v6
+        with:
+          path: clang-${{ env.CLANG_VERSION }}
+          key: clang-${{ env.CLANG_VERSION }}-${{ runner.os }}
+
+      - name: Download Clang toolchain
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p clang-${{ env.CLANG_VERSION }}
+          curl -fLSs \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ env.CLANG_BRANCH }}/${{ env.CLANG_VERSION }}.tar.gz" \
+            | tar -xz -C clang-${{ env.CLANG_VERSION }}/
+
+      - name: Setup Clang
+        run: |
+          chmod +x clang-${{ env.CLANG_VERSION }}/bin/clang
+          echo "$PWD/clang-${{ env.CLANG_VERSION }}/bin" >> $GITHUB_PATH
+          echo "CLANG_PATH=$PWD/clang-${{ env.CLANG_VERSION }}/bin" >> $GITHUB_ENV
+          $PWD/clang-${{ env.CLANG_VERSION }}/bin/clang --version | head -2
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: onyx-clang-${{ env.CLANG_VERSION }}-${{ github.ref_name }}
+          restore-keys: |
+            onyx-clang-${{ env.CLANG_VERSION }}-${{ github.ref_name }}
+            onyx-clang-${{ env.CLANG_VERSION }}-main
+            onyx-clang-${{ env.CLANG_VERSION }}-
+          max-size: 3G
+
+      - name: Apply ReSukiSU
+        run: |
+          KSU_BRANCH="${{ inputs.ksu_branch != '' && inputs.ksu_branch || 'main' }}"
+          echo "Applying ReSukiSU (branch: $KSU_BRANCH)..."
+          if curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" \
+               | bash -s -- "$KSU_BRANCH"; then
+            echo "KSU_STATUS=applied ($KSU_BRANCH)" >> $GITHUB_ENV
+          else
+            echo "KSU_STATUS=FAILED ($KSU_BRANCH)" >> $GITHUB_ENV
+            echo "::warning::ReSukiSU integration failed, continuing without it"
+          fi
+
+      - name: Apply SUSFS patches
+        if: inputs.enable_susfs
+        run: |
+          echo "Applying SUSFS patches..."
+          # gki-android15-6.6 matches this tree (android15-6.6 @ 6.6.82).
+          if git clone -q https://gitlab.com/simonpunk/susfs4ksu.git \
+               -b gki-android15-6.6 --depth 1 susfs4ksu; then
+            # CLO trees lack <linux/dma-buf.h> in fs/proc/base.c that the SUSFS
+            # context hooks expect; this script inserts it.
+            [ -f ".github/actions/fixup_susfs.sh" ] && bash .github/actions/fixup_susfs.sh .
+            SUSFS_PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch"
+            if [ -f "$SUSFS_PATCH" ] && patch -p1 --forward < "$SUSFS_PATCH"; then
+              # SUSFS ships the fully-patched sources alongside the patch; the
+              # patch alone only adds glue/context.
+              cp -v susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+              cp -v susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
+              echo "SUSFS_STATUS=applied" >> $GITHUB_ENV
+            else
+              echo "SUSFS_STATUS=patch-failed" >> $GITHUB_ENV
+              echo "::warning::SUSFS patch did not apply; config symbols will be dropped by olddefconfig"
+            fi
+          else
+            echo "SUSFS_STATUS=clone-failed" >> $GITHUB_ENV
+            echo "::warning::could not clone susfs4ksu"
+          fi
+
+      - name: Apply Droidspaces kABI patch
+        run: |
+          # SYSVIPC kABI fix (Droidspaces): moves sysvsem/sysvshm into the
+          # ANDROID_KABI_RESERVE(6/7/8) slots so enabling CONFIG_SYSVIPC does not
+          # shift task_struct offsets -> no vendor-module bootloop.
+          # This is the one patch that is NOT allowed to fail silently.
+          echo "Applying Droidspaces SYSVIPC kABI patch..."
+          patch -p1 --forward < .github/actions/droidspaces_sysvipc.patch
+          echo "DROIDSPACES_STATUS=applied" >> $GITHUB_ENV
+
+      - name: Configure kernel
+        run: |
+          export ARCH=arm64 SUBARCH=arm64
+
+          # Capybara tuning (HZ 300, ThinLTO, ZRAM LZ4, Droidspaces config block)
+          # already lives in onyx_defconfig -- nothing to sed here.
+          make O=out CC=clang LLVM=1 LLVM_IAS=1 "$DEFCONFIG"
+
+          # Xiaomi OEM modules from the in-tree vendor fragment. These are the
+          # same fragment the vendor build applies (build.config.msm.perf ->
+          # apply_defconfig_fragment vendor/onyx_perf.config).
+          if [ "${{ inputs.enable_vendor_modules }}" = "true" ]; then
+            echo "Merging $VENDOR_FRAGMENT ..."
+            ./scripts/kconfig/merge_config.sh -m -O out out/.config "$VENDOR_FRAGMENT" \
+              | sed 's/^/  /' || true
+          fi
+
+          # AutoFDO (non-fatal: the +archive endpoint 5xx when no profile is built)
+          if [ "${{ inputs.enable_autofdo }}" = "true" ] \
+             && mkdir -p afdo_profile \
+             && curl -fLSs --connect-timeout 30 --max-time 60 \
+                  "https://android.googlesource.com/kernel/common/+archive/refs/heads/android15-6.6/android/gki/aarch64/afdo.tar.gz" \
+                  2>/dev/null | tar -xz -C afdo_profile/ \
+             && [ -f "afdo_profile/kernel.afdo" ]; then
+            scripts/config --file out/.config -e CONFIG_AUTOFDO_CLANG
+            # scripts/Makefile.autofdo keys off CLANG_AUTOFDO_PROFILE exactly.
+            echo "CLANG_AUTOFDO_PROFILE=$PWD/afdo_profile/kernel.afdo" >> $GITHUB_ENV
+            echo "AUTOFDO_STATUS=enabled" >> $GITHUB_ENV
+            echo "  CONFIG_AUTOFDO_CLANG=y"
+          else
+            echo "AUTOFDO_STATUS=skipped" >> $GITHUB_ENV
+            echo "  AutoFDO skipped (disabled by input or profile unavailable)"
+          fi
+
+          # ABI-safe debug reduction. Every symbol here is chosen because turning
+          # it off does not resize or reorder any exported struct.
+          scripts/config --file out/.config \
+            -e CONFIG_DEBUG_INFO_REDUCED \
+            -d CONFIG_DEBUG_MISC -d CONFIG_BT_DEBUGFS \
+            -d CONFIG_DEBUG_MEMORY_INIT -d CONFIG_PROFILING \
+            -d CONFIG_PRINTK_CALLER -d CONFIG_RCU_TRACE \
+            -d CONFIG_CMA_DEBUGFS \
+            -d CONFIG_UBSAN -d CONFIG_UBSAN_BOUNDS \
+            -d CONFIG_UBSAN_ARRAY_BOUNDS -d CONFIG_UBSAN_LOCAL_BOUNDS \
+            -d CONFIG_UBSAN_SANITIZE_ALL -d CONFIG_UBSAN_TRAP \
+            -d CONFIG_CLEANCACHE -d CONFIG_PRINTK_TIME
+
+          # Single convergence point: drops anything whose dependencies are unmet
+          # (e.g. CONFIG_KSU* when SUSFS/ReSukiSU did not land) and re-derives
+          # CONFIG_HZ / CONFIG_ZRAM_DEF_COMP.
+          make O=out olddefconfig CC=clang LLVM=1 LLVM_IAS=1 2>/dev/null
+
+          # Droidspaces is only real if SYSVIPC survived AND the kABI patch held.
+          if grep -q "^CONFIG_SYSVIPC=y" out/.config; then
+            echo "DROIDSPACES_STATUS=applied (SYSVIPC=y, kABI-safe)" >> $GITHUB_ENV
+          else
+            echo "DROIDSPACES_STATUS=patch applied but CONFIG_SYSVIPC was dropped" >> $GITHUB_ENV
+            echo "::warning::CONFIG_SYSVIPC was dropped -- Droidspaces IPC unavailable"
+          fi
+
+          echo "=== Key configs ==="
+          for cfg in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_HZ CONFIG_LTO_CLANG_THIN \
+            CONFIG_CFI_CLANG CONFIG_ZRAM_DEF_COMP CONFIG_OVERLAY_FS CONFIG_SECCOMP \
+            CONFIG_NAMESPACES CONFIG_WIREGUARD CONFIG_AUTOFDO_CLANG CONFIG_MODVERSIONS \
+            CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_PID_NS \
+            CONFIG_DEVTMPFS CONFIG_ANDROID_KABI_RESERVE; do
+            val=$(grep "^${cfg}=" out/.config 2>/dev/null | cut -d= -f2)
+            [ -n "$val" ] && echo "  $cfg=$val" || echo "  $cfg=NOT SET"
+          done
+
+      - name: Build kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CCACHE_DIR="$PWD/.ccache"
+
+          JOBS=$(nproc --all 2>/dev/null || echo 16)
+          make -j"$JOBS" O=out CC="ccache clang" LLVM=1 LLVM_IAS=1 KCFLAGS="-w" 2>&1 | tee build.log
+
+          if [ -f "out/arch/arm64/boot/Image" ]; then
+            echo "Build SUCCESSFUL"
+            KREL=$(cat out/include/config/kernel.release 2>/dev/null || echo unknown)
+            echo "KERNEL_RELEASE=$KREL" >> $GITHUB_ENV
+            strings out/arch/arm64/boot/Image | grep 'Linux version' | head -1
+            echo "MODULES_BUILT=$(find out -name '*.ko' | wc -l)" >> $GITHUB_ENV
+          else
+            echo "Build FAILED"
+            tail -60 build.log
+            exit 1
+          fi
+
+      - name: Package AnyKernel3
+        run: |
+          TEMP_DIR="anykernel_temp"
+          rm -rf "$TEMP_DIR"
+          cp -r anykernel "$TEMP_DIR"
+
+          ZIMAGE_DIR="out/arch/arm64/boot"
+          if [ -f "$ZIMAGE_DIR/Image.gz-dtb" ]; then
+            cp -v "$ZIMAGE_DIR/Image.gz-dtb" "$TEMP_DIR/"
+          elif [ -f "$ZIMAGE_DIR/Image.gz" ]; then
+            cp -v "$ZIMAGE_DIR/Image.gz" "$TEMP_DIR/"
+          elif [ -f "$ZIMAGE_DIR/Image" ]; then
+            cp -v "$ZIMAGE_DIR/Image" "$TEMP_DIR/"
+          fi
+
+          if [ -d "$ZIMAGE_DIR/dts/vendor/qcom" ]; then
+            mkdir -p "$TEMP_DIR/dtb"
+            cp -v "$ZIMAGE_DIR"/dts/vendor/qcom/*.dtb "$TEMP_DIR/dtb/" 2>/dev/null || true
+            cp -v "$ZIMAGE_DIR"/dts/vendor/qcom/*.dtbo "$TEMP_DIR/dtb/" 2>/dev/null || true
+          fi
+
+          # Opt-in: hand the OEM modules to the zip. They are NOT flashed by
+          # AnyKernel3 (that would need a vendor_dlkm repack) -- this is for
+          # manual adb testing only.
+          if [ "${{ inputs.bundle_modules }}" = "true" ]; then
+            mkdir -p "$TEMP_DIR/modules"
+            find out -name '*.ko' -exec cp --parents {} "$TEMP_DIR/modules/" \; 2>/dev/null || true
+          fi
+
+          VERSION="${{ inputs.version != '' && inputs.version || github.run_number }}"
+          KREL="${{ env.KERNEL_RELEASE }}"
+          KS="${{ env.KERNEL_CODENAME }} CLO Kernel v${VERSION} (Linux ${KREL})"
+
+          # Stamp the real version into the flash script so the on-device banner
+          # can never go stale (gki-clo shipped a hardcoded "6.2" here forever).
+          sed -i "s|^kernel.string=.*|kernel.string=${KS}|" "$TEMP_DIR/anykernel.sh"
+          sed -i "s|^ui_print \"Flashing .*|ui_print \"Flashing ${KS}...\"|" "$TEMP_DIR/anykernel.sh"
+          grep -E "^kernel.string=|^ui_print \"Flashing" "$TEMP_DIR/anykernel.sh" | sed 's/^/  /'
+
+          ZIP_NAME="${{ env.KERNEL_CODENAME }}-Kernel-v${VERSION}-$(date +%Y%m%d).zip"
+          cd "$TEMP_DIR"
+          zip -r9 "../$ZIP_NAME" ./*
+          cd ..
+
+          rm -rf "$TEMP_DIR"
+          echo "ZIP_PATH=$PWD/$ZIP_NAME" >> $GITHUB_ENV
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          echo "Package: $ZIP_NAME ($(du -h "$ZIP_NAME" | cut -f1))"
+
+      - name: Upload kernel package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.KERNEL_CODENAME }}-Kernel
+          path: ${{ env.ZIP_PATH }}
+          archive: false
+          if-no-files-found: error
+
+      - name: Build summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## Build Complete
+
+          | Item | Value |
+          |------|-------|
+          | **Kernel** | Linux ${{ env.KERNEL_RELEASE }} (Xiaomi SM8735 / onyx GKI) |
+          | **Clang** | ${{ env.CLANG_VERSION }} (linux-x86) |
+          | **Defconfig** | \`${{ env.DEFCONFIG }}\` |
+          | **Vendor modules** | ${{ inputs.enable_vendor_modules && 'onyx_perf.config merged' || 'skipped' }} |
+          | **HZ** | 300 |
+          | **LTO** | ThinLTO (FullLTO conflicts with KCFI) |
+          | **ZRAM** | lz4 |
+          | **ReSukiSU** | ${{ env.KSU_STATUS }} |
+          | **SUSFS** | ${{ env.SUSFS_STATUS || 'disabled' }} |
+          | **Droidspaces** | ${{ env.DROIDSPACES_STATUS }} |
+          | **AutoFDO** | ${{ env.AUTOFDO_STATUS }} |
+          | **Modules built** | ${{ env.MODULES_BUILT }} |
+          | **Artifact** | ${{ env.ZIP_NAME }} |
+
+          Not ported yet: BBRv3, NTSYNC, Baseband-guard.
+          EOF

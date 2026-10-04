@@ -1,0 +1,61 @@
+From 769a5cfdc17b98d8e0bd491d45f5651180e42196 Mon Sep 17 00:00:00 2001
+From: nullptr-t-oss <127822226+nullptr-t-oss@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 09:18:23 +0000
+Subject: [PATCH] ABI: use ABI padding for SYSVIPC
+
+This commit allows us to enable CONFIG_SYSVIPC in defconfig without breaking kernel ABI.
+
+Root cause: enabling CONFIG_SYSVIPC normally injects `struct sysv_sem` / `struct sysv_shm`
+into the *middle* of task_struct, shifting every field that follows it. Vendor modules are
+built against the frozen GKI ABI, so they would read the wrong offsets and the device
+would bootloop. The fix moves those two fields onto the pre-existing ANDROID_KABI_RESERVE
+(6/7/8) u64 padding slots, which ANDROID_KABI_USE() overlays as a union:
+
+  - CONFIG_ANDROID_KABI_RESERVE=y (default y, drivers/android/Kconfig) makes the three
+    padding slots real `u64 android_kabi_reserved6/7/8` members, so total task_struct
+    size and all following offsets are unchanged.
+  - _ANDROID_KABI_REPLACE() emits a _Static_assert that sizeof(sysv_sem) <= 8 and that
+    alignment matches, so an overflow is a compile-time error, not a runtime bootloop.
+  - ANDROID_KABI_USE() is *not* gated on CONFIG_ANDROID_KABI, only the RESERVE side is --
+    which is why this works on a GKI tree that does not enforce kABI itself.
+  - The __GENKSYMS__ path keeps the original reserve fields, so genksyms still sees the
+    stable ABI.
+
+Regenerated against this tree (android15-6.6 @ 6.6.82) with exact context so it applies
+without fuzz. The upstream variant (6.6.77, with 2 lines of fuzz) lives in gki-clo.
+
+Signed-off-by: nullptr-t-oss <127822226+nullptr-t-oss@users.noreply.github.com>
+---
+ include/linux/sched.h | 14 ++++++++++++++--
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1075,8 +1075,8 @@ struct task_struct {
+ 	struct nameidata		*nameidata;
+ 
+ #ifdef CONFIG_SYSVIPC
+-	struct sysv_sem			sysvsem;
+-	struct sysv_shm			sysvshm;
++	// struct sysv_sem			sysvsem;
++	// struct sysv_shm			sysvshm;
+ #endif
+ #ifdef CONFIG_DETECT_HUNG_TASK
+ 	unsigned long			last_switch_count;
+@@ -1524,9 +1524,15 @@ struct task_struct {
+ 	ANDROID_KABI_RESERVE(3);
+ 	ANDROID_KABI_RESERVE(4);
+ 	ANDROID_KABI_RESERVE(5);
++
++#ifdef CONFIG_SYSVIPC
++	ANDROID_KABI_USE(6, struct sysv_sem sysvsem);
++	_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(7); ANDROID_KABI_RESERVE(8), struct sysv_shm sysvshm);
++#else
+ 	ANDROID_KABI_RESERVE(6);
+ 	ANDROID_KABI_RESERVE(7);
+ 	ANDROID_KABI_RESERVE(8);
++#endif
+ 
+ #ifdef CONFIG_RV
+ 	/*

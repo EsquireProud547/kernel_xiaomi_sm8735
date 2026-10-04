@@ -99,6 +99,13 @@ modules.order
 !.cocciconfig
 !.get_maintainer.ignore
 !.gitattributes
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+!.github/workflows/*.yaml
+!.github/actions/
+!.github/actions/*.patch
+!.github/actions/*.sh
 !.gitignore
 !.kunitconfig
 !.mailmap
