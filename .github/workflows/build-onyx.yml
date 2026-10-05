@@ -245,8 +245,47 @@ jobs:
           # shift task_struct offsets -> no vendor-module bootloop.
           # This is the one patch that is NOT allowed to fail silently.
           echo "Applying Droidspaces SYSVIPC kABI patch..."
-          patch -p1 --forward < .github/actions/droidspaces_sysvipc.patch
-          echo "DROIDSPACES_STATUS=applied" >> $GITHUB_ENV
+          # -r keeps the .rej files in a directory we read, rather than
+          # scattering them through the tree where nobody looks.
+          rm -rf droidspaces_rej && mkdir droidspaces_rej
+          set +e
+          patch -p1 --forward -r droidspaces_rej \
+            < .github/actions/droidspaces_sysvipc.patch > droidspaces_rej/out 2>&1
+          PATCH_RC=$?
+          set -e
+          echo "  patch: exit=$PATCH_RC failed=$(grep -c FAILED droidspaces_rej/out || true) offsets=$(grep -c offset droidspaces_rej/out || true) fuzz=$(grep -c 'with fuzz' droidspaces_rej/out || true)"
+          if [ "$PATCH_RC" -ne 0 ] || [ "$(find droidspaces_rej -name '*.rej' | wc -l)" -gt 0 ]; then
+            echo "::error::Droidspaces SYSVIPC kABI patch did not apply cleanly"
+            cat droidspaces_rej/out
+            find droidspaces_rej -name '*.rej' -exec cat {} \;
+            exit 1
+          fi
+          # Positive assertion that it landed, not just that patch did not
+          # complain. This mirrors what the SUSFS step above does for its
+          # fuzz-prone hunk, and it matters more here: without this patch,
+          # genksyms sees sysvsem/sysvshm in the middle of task_struct, the
+          # CRCs diverge, and every vendor_dlkm module importing a task_struct
+          # symbol fails to load -- the exact bootloop it exists to prevent.
+          # Measured: genksyms gives a different CRC for SYSVIPC=n vs SYSVIPC=y
+          # without the patch, and the identical CRC with it.
+          #
+          # All four are strings from the patch itself, so they also fail if a
+          # future rebase relocates the fields somewhere unintended.
+          # -F, not a regex: these strings contain (, ) and +, which are
+          # operators in an extended pattern and silently change the match.
+          # The last two need [[:space:]]* because the real prefix is a tab,
+          # so '^//' does not match them at all.
+          grep -qF 'ANDROID_KABI_USE(6, struct sysv_sem sysvsem);' include/linux/sched.h \
+            || { echo "::error::sysvsem not moved onto KABI slot 6 -- patch did not land"; exit 1; }
+          grep -qF '_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(7); ANDROID_KABI_RESERVE(8), struct sysv_shm sysvshm)' include/linux/sched.h \
+            || { echo "::error::sysvshm not moved onto KABI slots 7+8 -- patch did not land"; exit 1; }
+          grep -qE '^[[:space:]]*// *struct sysv_sem' include/linux/sched.h \
+            || { echo "::error::mid-struct sysv_sem is not commented out"; exit 1; }
+          grep -qE '^[[:space:]]*// *struct sysv_shm' include/linux/sched.h \
+            || { echo "::error::mid-struct sysv_shm is not commented out"; exit 1; }
+          echo "  landed: sysvsem on KABI slot 6, sysvshm on slots 7+8, mid-struct fields commented out"
+          rm -rf droidspaces_rej
+          echo "DROIDSPACES_STATUS=applied (SYSVIPC=y, kABI-safe, hooks verified)" >> $GITHUB_ENV
 
       - name: Configure kernel (official Kleaf-style synthesis)
         run: |
