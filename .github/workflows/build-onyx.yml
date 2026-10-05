@@ -596,10 +596,11 @@ jobs:
             cp -v "$ZIMAGE_DIR"/dts/vendor/qcom/*.dtbo "$TEMP_DIR/dtb/" 2>/dev/null || true
           fi
           # The branch above is currently inert: this tree has no SM8735/onyx
-          # dtsi (arch/arm64/boot/dts/qcom holds 381 legacy SoC trees), so the
-          # device takes its device tree from the vendor side. Kept because it
-          # becomes live the moment a DTS-capable tree is used, and dropping it
-          # would silently lose the dtb/ on that day.
+          # dtsi (arch/arm64/boot/dts/qcom holds 160 legacy dtsi, zero matches
+          # for *onyx* or *sm8735*), so the device takes its device tree from
+          # the vendor side. Kept because it becomes live the moment a
+          # DTS-capable tree is used, and dropping it would silently lose the
+          # dtb/ on that day.
 
           # Opt-in: hand the OEM modules to the zip. They are NOT flashed by
           # AnyKernel3 (that would need a vendor_dlkm repack) -- this is for

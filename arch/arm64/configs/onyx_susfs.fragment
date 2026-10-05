@@ -8,7 +8,10 @@
 # behaviour: a silently dead SUSFS is worse than a failed build.
 #
 # Only the two entry points are listed. Every sub-option of CONFIG_KSU_SUSFS is
-# "bool ... default y" in that Kconfig, so enabling the parent enables all ten:
+# "bool ... default y" in that Kconfig, so enabling the parent enables all of
+# them. The names below are documentation only -- the count is deliberately not
+# asserted, because susfs4ksu's Kconfig is only present at CI time (that repo is
+# cloned, not vendored) and a hardcoded count rots silently on the next rename:
 #
 #   KSU_SUSFS_SUS_PATH                   KSU_SUSFS_SPOOF_UNAME
 #   KSU_SUSFS_SUS_MOUNT                  KSU_SUSFS_ENABLE_LOG
