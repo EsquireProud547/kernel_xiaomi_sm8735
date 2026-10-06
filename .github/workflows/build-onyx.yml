@@ -27,6 +27,18 @@ name: Build Onyx Kernel
 #
 #   * permissions is contents: read; nothing here writes to the repository.
 #
+# There is deliberately NO "trim debug features" input. One existed here too,
+# and on the 6.6.142 tree it turned out to be what made the kernel hang on the
+# Xiaomi logo: turning off 14 debug symbols (UBSAN, CLEANCACHE,
+# DEBUG_MEMORY_INIT, ...) bricked the device, confirmed by a single-variable
+# bisect with LTO and AutoFDO both left ON. Worth recording why it went
+# unnoticed: the reduction measured as "20 symbols, all debug-only" and every
+# config gate stayed green the whole time, because diffing .config files shows
+# what disappeared but never whether the kernel still behaves the same way.
+# CLEANCACHE is the Qualcomm tmem victim cache consulted during page reclaim,
+# so it changes a runtime decision rather than only emitting diagnostics. The
+# full account is in README-build-onyx.md of the seventeen tree.
+#
 # Not ported: BBRv3, NTSYNC, Baseband-guard (absent from 6.6.82).
 
 env:
@@ -60,10 +72,6 @@ on:
         default: true
       enable_btf:
         description: "BTF for eBPF/CO-RE (needs pahole >= 1.21; auto-disabled if missing)"
-        type: boolean
-        default: true
-      reduce_debug:
-        description: "Trim UBSAN/profiling/debugfs (ABI-safe; applied to the merged defconfig)"
         type: boolean
         default: true
       bundle_modules:
@@ -270,7 +278,6 @@ jobs:
 
           BASE_DEFCONFIG=arch/arm64/configs/gki_defconfig
           TUNING_FRAGMENT=arch/arm64/configs/onyx_gki.fragment
-          DEBUG_FRAGMENT=arch/arm64/configs/onyx_debug_reduction.fragment
           SUSFS_FRAGMENT=arch/arm64/configs/onyx_susfs.fragment
           MERGED_DEFCONFIG=onyx_gki_defconfig
           MERGED_PATH="out/arch/arm64/configs/$MERGED_DEFCONFIG"
@@ -328,7 +335,7 @@ jobs:
           #
           # Turning BTF *off* is a deliberate override, not a fragment: the base
           # has it as =y, so a fragment saying =n would trip gate 1. It is
-          # therefore applied below with the debug reduction, before make.
+          # therefore applied below as an override, before make.
           BTF_OFF=0
           if [ "${{ inputs.enable_btf }}" != "true" ] || [ "${{ env.BTF_UNAVAILABLE }}" = "1" ]; then
             echo "  BTF disabled (input off, or pahole older than v1.21)"
@@ -366,10 +373,7 @@ jobs:
           #
           # The vendor build's fragments are strictly additive: anything that
           # flips a value the base already sets is an accident (two fragments
-          # disagreeing) and must fail loudly. The debug reduction below is the
-          # one deliberate exception, and it is therefore NOT a fragment -- it
-          # is applied to the merged defconfig after the merge and before make,
-          # which keeps this gate strict and still lets gate 3 see the truth.
+          # disagreeing) and must fail loudly.
           mkdir -p out/arch/arm64/configs
           MERGE_OUT=$(mktemp)
           KCONFIG_CONFIG="$PWD/$MERGED_PATH" \
@@ -390,18 +394,6 @@ jobs:
           # base already sets has to happen here -- still BEFORE make, so that
           # gate 3's diffconfig stays a real assertion.
           OVERRIDE_ARGS=""
-          if [ "${{ inputs.reduce_debug }}" = "true" ]; then
-            while IFS= read -r line; do
-              case "$line" in
-                CONFIG_*)                  OVERRIDE_ARGS="$OVERRIDE_ARGS -e ${line%%=*}" ;;
-                "# CONFIG_"*" is not set")
-                                            OVERRIDE_ARGS="$OVERRIDE_ARGS -d $(echo "${line#\# }" | cut -d' ' -f1)" ;;
-              esac
-            done < "$DEBUG_FRAGMENT"
-            echo "  debug reduction: $(echo $OVERRIDE_ARGS | wc -w) overrides from $DEBUG_FRAGMENT"
-          else
-            echo "  debug reduction disabled, keeping the GKI base defaults"
-          fi
 
           if [ "$BTF_OFF" = "1" ]; then
             # DEBUG_INFO_BTF_MODULES must go too, and so must the symbol that
@@ -473,8 +465,8 @@ jobs:
           #
           # Deviation from the vendor gate, and why: upstream fails on ANY
           # non-"+" line, because the vendor build never touches the config
-          # after the merge. We do one deliberate reduction (applied above),
-          # and turning CONFIG_UBSAN off makes its children invisible, so
+          # after the merge. We do apply deliberate overrides (see above), and
+          # turning CONFIG_UBSAN off would make its children invisible, so
           # diffconfig reports "-UBSAN_BOOL n" for a symbol that was already
           # unset and is merely no longer printed. That is not a dropped
           # request.

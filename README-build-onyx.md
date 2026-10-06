@@ -11,6 +11,64 @@
 
 ---
 
+## 成果一览
+
+| 功能 | 状态 | 实现位置 |
+|------|------|----------|
+| 官方 Kleaf 配置合成 | ✅ | Configure 步骤（`build-onyx.yml`） |
+| 三道配置闸门 | ✅ 3/3 通过 | 同上 |
+| BTF（eBPF/CO-RE） | ✅ CI 验证 | GKI base 提供 + 守卫 |
+| 模块签名 SHA-512 | ✅ CI 验证 | GKI base 提供 |
+| Droidspaces SYSVIPC | ✅ kABI 安全 | `droidspaces_sysvipc.patch` |
+| Droidspaces 其余选项 | ✅ 跟上上游 2026-10-04 | `onyx_gki.fragment` |
+| ReSukiSU (KernelSU) | ✅ CI 验证 | `build-onyx.yml` |
+| SUSFS | ✅ CI 验证 | `susfs4ksu` + `onyx_susfs.fragment` |
+| HZ 300 / ThinLTO / zram lz4 | ✅ CI 验证 | `onyx_gki.fragment` |
+| AutoFDO | ⚠️ 非致命 | `build-onyx.yml` |
+| 调试裁剪 | ❌ **已删除** | 它就是变砖元凶，见下文 |
+| Xiaomi vendor 内建 | ⚠️ 过滤偏粗 | `onyx_perf.config` 的 `=y` |
+| ccache 三级键 | ✅ 7.15% 命中 | `build-onyx.yml` |
+| AnyKernel3 刷机包 | ✅ 可刷入 | `anykernel/`（工具必须是 aarch64） |
+| BBRv3 / NTSYNC / Baseband-guard | ❌ 未移植 | 6.6.82 无此特性 |
+| `Module.symvers` CRC 校验 | ❌ 未实现 | 需设备基线 |
+
+图例：✅ CI 日志实证 · ⚠️ 代码就绪但有已知局限 · ❌ 未做
+
+---
+
+## 流水线总图
+
+`ubuntu-26.04`，`timeout-minutes: 120`，**17 个 step**，
+`permissions: contents: read`。
+
+```
+ 1  Checkout kernel source          ref: oss, fetch-depth: 0
+ 2  Fast cleanup + swap            删 dotnet/swift/go，固定重建 20GB swap
+ 3  Install build dependencies     flex bison libelf-dev lz4 …
+ 4  Install pahole for BTF  ★if    dwarves；< 1.21 则降级而非失败
+ 5  Patch libbpf            ★if    C23 strchr const 修正
+ 6  Cache Clang toolchain          actions/cache
+ 7  Download Clang toolchain  ★    android17-release/clang-r596125
+ 8  Setup Clang
+ 9  Setup ccache                   三级 restore-keys
+10  Apply ReSukiSU                 curl setup.sh | bash -s main
+11  Apply SUSFS patches      ★if   susfs4ksu @ gki-android15-6.6
+12  Apply Droidspaces kABI patch   唯一不允许静默失败的补丁
+13  Configure kernel               ★ 合成 + 3 闸门
+14  Build kernel                   make -j$(nproc) … KCFLAGS="-w"
+15  Package AnyKernel3
+16  Upload kernel package          upload-artifact，archive: false
+17  Build summary                  写入 STEP_SUMMARY 表格
+```
+
+★ = 受 `workflow_dispatch` 输入控制。
+
+`permissions: contents: read` 是刻意收紧的。流水线把 `curl … | bash -s`
+（第 10 步）直接喂给 shell，并 clone 一个会移动的分支（`susfs4ksu`），
+被投毒的依赖不应该能往仓库里推东西。
+
+---
+
 ## 文件清单
 
 | 文件 | 来源 | 说明 |
@@ -20,7 +78,6 @@
 | `.github/actions/fixup_susfs.sh` | gki-clo | 逐字节一致 |
 | `.github/actions/libbpf_strchr_const.patch` | **新增** | BTF 前提：修 libbpf 在新编译器下的 const 错误 |
 | `arch/arm64/configs/onyx_gki.fragment` | **新增** | Capybara 调优 |
-| `arch/arm64/configs/onyx_debug_reduction.fragment` | **新增** | UBSan/debugfs 裁剪（`PROFILING` 已剔除） |
 | `arch/arm64/configs/onyx_susfs.fragment` | **新增** | ReSukiSU + SUSFS，条件合入 |
 | `anykernel/` | **上游 [osm0sis/AnyKernel3](https://github.com/osm0sis/AnyKernel3) @ `020dfec`** | 版本号改为打包时动态写入 |
 | `.gitignore` | 修改 | 加 `!.github/` 例外（见下） |
@@ -57,22 +114,21 @@ arch/arm64/configs/gki_defconfig          官方 GKI 基线（786 行）
 
 ### 两处刻意偏离官方
 
-**1. 片段只能新增 → 需要两处 merge 后的改写**
+**1. 片段只能新增 → BTF 关闭必须在 merge 后改写**
 
-官方 merge 之后不再碰配置；我们有两处必须改写基线已有的值：
+官方 merge 之后不再碰配置；基线自带 `DEBUG_INFO_BTF=y`，用 fragment 写 `=n` 会直接撞
+闸门 ①，所以关闭 BTF 只能在 merge 之后、`make` 之前由 `scripts/config` 施加。
 
-- **调试裁剪**（15 项）—— 基线本身有 `PROFILING=y`、`UBSAN=y` 等
-- **BTF 关闭**（3 项）—— 基线有 `DEBUG_INFO_BTF=y`，用 fragment 写 `=n` 会直接撞闸门 ①
+> 这里原本还有第二处：调试裁剪（15 项）。**它已经被删除了**，原因见下文「调试裁剪曾经让设备变砖」。
 
-所以这两处走 `onyx_debug_reduction.fragment`（保持声明式）+ 在 merge 后、`make` 之前由
-`scripts/config` 施加到 merged defconfig 上。AutoFDO 同理，挪到 merge 之前做成 fragment ——
-这样 merge 之后**没有任何 `scripts/config` 改动**，闸门 ③ 才是真断言。
+AutoFDO 挪到 merge 之前做成 fragment，这样 merge 之后**除 BTF 关闭外没有任何
+`scripts/config` 改动**，闸门 ③ 才是真断言。
 
 **2. 闸门 ③ 的判据放宽**
 
-官方对任何非 `+` 行都失败。我们关掉 `CONFIG_UBSAN` 会让子项不可见，`diffconfig` 会报
-`-UBSAN_BOOL n` —— 那是"本来就未设置"，不是被丢弃的请求。因此只对 `-SYM y` / `-SYM m` /
-`-SYM y -> m` 报错，其余按计数放过（实测放过 9 个）。
+官方对任何非 `+` 行都失败。`olddefconfig` 会把**本来就没设过**的符号报成 `-SYM n`，
+那是"本来就未设置"，不是被丢弃的请求。因此只对 `-SYM y` / `-SYM m` / `-SYM y -> m`
+报错，其余按计数放过（裁剪删除后实测放过 0 个）。
 
 ### 与"完全官方"的差距
 
@@ -139,7 +195,7 @@ lib/Kconfig.debug:375  config DEBUG_INFO_BTF
 
 ### 三个前提
 
-1. **`DEBUG_INFO_REDUCED` 必须关** —— 裁剪片段明确不碰它
+1. **`DEBUG_INFO_REDUCED` 必须关** —— 基线自带 `=n`，不要用 fragment 去改
 2. **pahole ≥ 1.21**（DWARF5 门槛）—— CI 装 `dwarves` 并校验；版本过低时**降级为
    不启用 BTF** 而非失败（本次实测 v1.31，附带 `BTF_TAG`）
 3. **`tools/lib/bpf` 编译失败** —— `DEBUG_INFO_BTF` 触发 `make prepare` →
@@ -344,7 +400,6 @@ fi
 | `enable_vendor_modules` | `true` | 合入 `onyx_perf.config` 的 `=y` 条目 |
 | `enable_autofdo` | `true` | 用上游 GKI AutoFDO profile（失败自动跳过） |
 | `enable_btf` | `true` | BTF（需 pahole ≥ 1.21；装不上或过低时降级为关闭，不失败） |
-| `reduce_debug` | `true` | UBSan/debugfs 裁剪，施加在 merged defconfig 上 |
 | `bundle_modules` | `false` | 把 `.ko` 放进 zip 的 `modules/`（不参与刷写） |
 
 ---
@@ -363,6 +418,36 @@ swap 建 19 GiB，**用量 0 B**（内存充裕，ThinLTO 未吃到 swap 压力�
 
 **ccache 首次命中率仅 7.15%**（249/3484）—— 恢复的缓存来自上一轮在配置阶段就失败的任务，
 它从未进入编译。本次已存下 3484 条新条目，**下一轮同配置应显著提升**。
+
+---
+
+## 调试裁剪曾经让设备变砖（已删除）
+
+本仓库一度有一个 `reduce_debug` 开关（默认开启），关掉 15 个调试符号：
+`UBSAN` 家族、`CLEANCACHE`、`DEBUG_MEMORY_INIT`、`PRINTK_CALLER`、`PRINTK_TIME`、
+`RCU_TRACE`、`BT_DEBUGFS` 等。
+
+**在姊妹树 `android_kernel_xiaomi_sm8735`（`seventeen` @ 6.6.142）上，用这个开关
+构建出的内核会卡在小米 logo 上不开机，也无法进 recovery。** 单一变量法确认：
+`enable_thinlto=true` + `enable_autofdo=true` + `reduce_debug=false` 时正常开机。
+
+真正值得记下来的是**为什么没人发现**：
+
+- 裁剪的代价经过实测是"20 个符号，全是调试功能"，看起来很安全；
+- 三道闸门**全程绿灯**；
+- 因为 `.config` 文本对比只能看出**什么消失了**，看不出**内核行为是否还一样**。
+
+具体到元凶：`CLEANCACHE` 是 Qualcomm tmem 的受害者缓存，PFRA 换页时会被查询，
+它改变的是**运行时内存回收决策**，不是诊断输出。这类东西在配置层面永远看不出来。
+
+因此本树也把裁剪**整块删除**，没有保留开关，也没有保留子集。教训写进了三处：
+`build-onyx.yml` 头部、`onyx_gki.fragment` 顶部的编辑规则（第三条），以及姊妹树的
+同名文档。
+
+> 姊妹树上还有一次"裁剪是无辜的"的误判：官方配置本来也开着 `UBSAN_TRAP` 和
+> `UBSAN_SANITIZE_ALL`，且能开机的版本 UBSAN 是开着的，于是差点把裁剪排除掉。
+> 能开机的那个版本同时也关了 LTO 和 AutoFDO——**一次动了三个变量**，
+> 什么都证明不了。排除法必须一次只动一个。
 
 ---
 
@@ -387,3 +472,22 @@ swap 建 19 GiB，**用量 0 B**（内存充裕，ThinLTO 未吃到 swap 压力�
 | **BBRv3** | 6.6.82 无 `net/ipv4/tcp_bbr3.c` | 拷 `tcp_bbr3.c` + `net/ipv4/Kconfig`(3 处) + `Makefile`(1 处) |
 | **NTSYNC** | 6.6.82 无 `drivers/misc/ntsync.c` | 拷 `ntsync.c`(1218 行) + `include/uapi/linux/ntsync.h` + Kconfig + Makefile |
 | **Baseband-guard** | 6.6.82 无 `security/baseband-guard` | 拷 14 个文件 + `security/Kconfig`、`security/Makefile`、`security/baseband-guard` 符号链接 |
+
+---
+
+## 提交历史
+
+```
+8702d7358702  ak3: restore aarch64 tools, upstream master only ships 32-bit ARM
+b6c7068b8f44  ak3: update AnyKernel3 to upstream 020dfec, clean up packaging
+be04d83ab2e2  config: cut SUSFS fragment to the two known symbols, drop UAPI_HEADER_TEST
+9e0b3b6b5fca  config: KSU_SUSFS_SUS_PATH is a bool, revert to =y
+43c0984ebcaa  ci: make the config gates self-protecting, drop write permission
+da2e27a5cace  ci: switch to official Kleaf config synthesis, restore BTF
+9b5fa60c2b82  ci: fix modpost failure, enable SUSFS, honour make exit code
+54c52cf9b191  ci: add build-onyx workflow (Capybara tuning on onyx GKI)
+```
+
+从下往上看就是完整的演进史：先从 gki-clo 移植，再修 modpost 和 SUSFS，
+再把配置合成换成官方方式（顺带修好 BTF 和模块签名），再收紧权限，
+最后修 AK3 架构回归。

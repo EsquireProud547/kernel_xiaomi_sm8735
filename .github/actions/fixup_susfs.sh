@@ -1,7 +1,11 @@
 #!/bin/bash
-# SUSFS context fixup for CLO kernels
-# The SUSFS patch expects <linux/dma-buf.h> in fs/proc/base.c
-# which AOSP GKI has but CLO kernels don't.
+# Make sure <linux/dma-buf.h> is included in fs/proc/base.c, which the SUSFS
+# context hooks expect.
+#
+# On THIS tree (android15-6.6 @ 6.6.82) the include is genuinely absent, so
+# this is what adds it. The sibling seventeen tree already has it at
+# fs/proc/base.c:103 and treats the same script as a self-checking no-op,
+# which is why it stays idempotent.
 set -e
 
 KERNEL_ROOT="${1:-.}"

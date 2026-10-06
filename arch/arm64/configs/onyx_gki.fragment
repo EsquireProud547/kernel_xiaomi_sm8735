@@ -19,8 +19,17 @@
 #   2. Never set a symbol whose dependencies will not be met. olddefconfig
 #      drops it silently, the diffconfig gate then fails the build
 #      ("Defconfig fragment did not apply as expected").
+#   3. Never turn a symbol the base already has OFF. No gate catches this one.
+#      A debug reduction lived here and bricked the device on the 6.6.142
+#      tree: the kernel hung on the Xiaomi logo until it was removed. Its
+#      cost had measured as "20 symbols, all debug-only" with every gate
+#      green, because a .config diff shows what disappeared, not whether the
+#      kernel still behaves the same. CLEANCACHE (the Qualcomm tmem victim
+#      cache, consulted during page reclaim) changes a runtime decision.
 #
-# In short: every line here is a promise that the kernel will honour.
+# In short: every line here is a promise that the kernel will honour, and
+# that turning something off is a claim about runtime behaviour that no
+# build-time check can verify.
 #
 
 # --- Timer frequency -------------------------------------------------------
@@ -53,6 +62,15 @@ CONFIG_IPC_NS=y
 
 # --- Namespaces and container compatibility --------------------------------
 # PID_NS + devtmpfs are what a container runtime expects to exist.
+#
+# CONFIG_PID_NS appears in gki_defconfig as "# ... is not set" and here as =y,
+# so a naive `cat` of the two files produces "warning: override: reassigning
+# to symbol PID_NS" and this tree's gate 2 would fail on it. The Configure
+# step concatenates via scripts/kconfig/merge_config.sh, which collapses the
+# pair into a single assignment, so the warning does not appear. Do not
+# "fix" it by restating the unset form here: that adds a third assignment and
+# makes it worse. merge_config only reports an override when the PREVIOUS
+# value was =y or =m, so turning PID_NS on stays compatible with gate 1.
 CONFIG_PID_NS=y
 CONFIG_DEVTMPFS=y
 
@@ -60,3 +78,66 @@ CONFIG_DEVTMPFS=y
 CONFIG_USER_NS=y
 CONFIG_TMPFS_POSIX_ACL=y
 CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+
+# --- Droidspaces: NAT66 ----------------------------------------------------
+# SOURCE: ravindu644/Droidspaces-OSS Documentation/Kernel-Configuration.md,
+# the "配置 GKI 内核" block, at commit 92cee27 (2026-10-05). That block is the
+# authoritative list: upstream states these specific options are kABI-safe only
+# in combination with the Step 1 sysvipc patch, and warns against enabling
+# anything beyond it.
+#
+# Without these, a container in NAT mode is IPv4 only. IP6_NF_NAT depends on
+# NF_CONNTRACK and NETFILTER_ADVANCED and selects NF_NAT, so no extra line is
+# needed for NAT66. IP6_NF_TARGET_MASQUERADE selects
+# NETFILTER_XT_TARGET_MASQUERADE.
+CONFIG_IP6_NF_NAT=y
+CONFIG_IP6_NF_TARGET_MASQUERADE=y
+
+# --- Droidspaces: UFW support inside the container -------------------------
+# Optional: only needed to run UFW or fail2ban inside a container, and only in
+# NAT mode so the container does not fight the host's own firewall.
+# XT_TARGET_LOG selects NF_LOG_SYSLOG; XT_MATCH_RECENT depends on
+# NETFILTER_ADVANCED, which the base already satisfies.
+CONFIG_NETFILTER_XT_TARGET_LOG=y
+CONFIG_NETFILTER_XT_MATCH_RECENT=y
+
+# --- Droidspaces: fail2ban support (ipset) ---------------------------------
+# IP_SET is a menuconfig depending on INET && NETFILTER, both =y here. The two
+# hash types are the ones fail2ban uses, and XT_SET depends on IP_SET plus
+# NETFILTER_ADVANCED, so the order below is also the dependency order.
+CONFIG_IP_SET=y
+CONFIG_IP_SET_HASH_IP=y
+CONFIG_IP_SET_HASH_NET=y
+CONFIG_NETFILTER_XT_SET=y
+
+# --- tmpfs extended attributes ---------------------------------------------
+# NixOS support. TMPFS_XATTR enables trusted.*, security.* and user.* xattr
+# namespaces on tmpfs; it is what POSIX ACL support on tmpfs needs, so it pairs
+# with CONFIG_TMPFS_POSIX_ACL above. Depends on TMPFS, =y in the base.
+CONFIG_TMPFS_XATTR=y
+
+# --- Deliberately NOT enabled: CONFIG_CFS_BANDWIDTH and CONFIG_CGROUP_PIDS --
+# These power `--cpus` and `--pids-limit`. Droidspaces' own guide keeps them
+# commented out of the GKI block and explains why: they resize the scheduler
+# and cgroup structures, so the CRC of thousands of exported symbols changes
+# (4101 of them, measured upstream on a 5.15 GKI tree). Stock vendor modules
+# were built against the old CRCs, they refuse to load, and without display,
+# storage and Wi-Fi the device bootloops.
+#
+# Unlike CONFIG_SYSVIPC, the new fields do not fit the ANDROID_KABI_RESERVE
+# padding, so droidspaces_sysvipc.patch cannot help here. They can only be
+# turned on if EVERY module is rebuilt from this same tree and vendor_boot,
+# vendor_dlkm and system_dlkm are flashed together with the new boot.img.
+# Left off. CONFIG_MEMCG is already =y in the GKI base, so --memory works.
+
+# NOTE: upstream's GKI block also lists CONFIG_NETFILTER_XT_TARGET_REJECT. That
+# symbol no longer exists in 6.6; the REJECT target moved to
+# CONFIG_IP_NF_TARGET_REJECT / CONFIG_IP6_NF_TARGET_REJECT, and both are already
+# =y in gki_defconfig. Writing the old name would be dropped by olddefconfig
+# and would then fail the diffconfig gate.
+#
+# Likewise CONFIG_CGROUP_DEVICE appears in upstream's non-GKI block but not in
+# its GKI block, and upstream's "what breaks if missing" table calls it fatal.
+# It has no Kconfig dependencies in 6.6 and is not in the frozen kABI list, so
+# it could be turned on, but stock onyx does not have it either and upstream
+# deliberately omits it from the kABI-tested set. Not added.
